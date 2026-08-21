@@ -101,11 +101,12 @@ The official model card documents Transformers support. Install a PyTorch build
 appropriate for CUDA, Apple MPS, or CPU, then install the model-card minimum
 Transformers version. This repository supplies `providers/nemotron_transformers.py`
 as a segmented command adapter and `providers/nemotron_transformers_server.py`
-as a timestamp-capable HTTP server.
+as a timestamp/confidence-capable HTTP server.
 
 The HTTP server uses Nemotron's cache-aware streaming path inside one request,
 returns native word timestamps, and clips its padded final inference chunk to
-the true audio duration:
+the true audio duration. With `confidence=true`, it also captures greedy RNNT
+maximum-softmax scores and aggregates each word with the minimum token score:
 
 ```bash
 export NEMOTRON_MODEL_DIR=/path/to/nemotron-3.5-asr-streaming-0.6b
@@ -119,6 +120,11 @@ Then use `--asr-mode whole` with
 `http://127.0.0.1:1239/v1/audio/transcriptions`. Lookahead 13 corresponds to
 the model's highest documented streaming latency/accuracy setting (1120 ms);
 interactive applications may prefer a smaller supported value.
+
+Set `--asr-language` to a known locale such as `en-US` when possible; `auto`
+uses Nemotron's language-detection prompt. See [Performance](PERFORMANCE.md) for
+measured cold/warm latency and GPU-memory tradeoffs against the original
+text-only shim.
 
 This path is convenient for Python environments but downloads a larger full
 checkpoint and has a heavier dependency stack than the GGUF runtime.

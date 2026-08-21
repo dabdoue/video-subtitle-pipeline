@@ -24,7 +24,9 @@ The JSON manifest is the source of truth. It retains:
 - nominal subtitle ranges;
 - the ASR mode and audio range;
 - raw source text and native word timestamps;
+- optional per-word decoder confidence and calculation metadata;
 - the source text assigned to each nominal anchor;
+- frame-assisted review proposals, frame timestamps/hashes, and apply status;
 - translation parts and rendered cue timing;
 - provider/model names without credentials or the endpoint URL.
 
@@ -136,6 +138,7 @@ video-subtitle-pipeline video.mp4 \
   --asr-provider openai-compatible \
   --asr-mode whole \
   --asr-model nvidia/nemotron-3.5-asr-streaming-0.6b \
+  --asr-language en-US \
   --allow-audio-upload \
   --translate-provider codex \
   --target-language Korean \
@@ -147,6 +150,39 @@ Remote HTTP ASR refuses to run without `--allow-audio-upload`. Loopback URLs do
 not require that flag. Only a temporary mono 16 kHz WAV is sent, never the video
 container or frames. Whole mode requires a verbose response with `words`,
 `start`, and `end`; use `--asr-mode segmented` for text-only endpoints.
+
+Use `--asr-language en-US` when the spoken language is known. `auto` is the
+portable default, but explicit Nemotron prompt conditioning can materially
+improve recognition.
+
+## Confidence-assisted frame review
+
+The bundled Transformers server can attach an RNNT maximum-softmax score to
+each emitted token and aggregate a word's score with `min`. These values are
+useful ranking signals, not calibrated probabilities that a word is correct.
+
+```bash
+video-subtitle-pipeline video.mp4 \
+  --asr-mode whole \
+  --asr-confidence \
+  --visual-review-provider codex \
+  --visual-review-model gpt-5.6-luna \
+  --visual-review-confidence-threshold 0.6 \
+  --allow-frame-upload
+```
+
+For each selected anchor, the pipeline samples a frame at its lowest-confidence
+word and sends bounded transcript/neighbor context plus the frame through
+`codex exec --image`. Proposal-only is the default. Raw ASR remains immutable,
+and the manifest records the proposal, rationale, evidence class, frame time,
+and SHA-256 hash.
+
+`--visual-review-apply` is an explicit higher-risk opt-in. Generic
+`visual_context` proposals are never applied, but vision models can still
+misread or invent `visible_text`; human validation remains necessary.
+
+Current OpenAI models, including GPT-5.6 Luna, support image input:
+https://developers.openai.com/api/docs/models
 
 ### Segmented compatibility mode
 
@@ -190,9 +226,10 @@ video-subtitle-pipeline video.mp4 \
 ```
 
 The adapter imports Transformers only when invoked; it is not a core dependency.
-For a timestamp-capable HTTP deployment, use
+For a timestamp/confidence-capable HTTP deployment, use
 `providers/nemotron_transformers_server.py`; it runs long inputs as one
-cache-aware stream and exposes OpenAI-style verbose word timestamps.
+cache-aware stream and exposes OpenAI-style verbose word timestamps plus
+optional decoder confidence.
 
 ### Local LLM through Ollama
 

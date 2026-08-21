@@ -6,13 +6,15 @@ Guidance for humans and coding agents working in this repository.
 
 - This repository is a standalone video transcription/translation tool. Do not
   add dependencies on the original Modelythic router checkout.
-- Five-second nominal anchors, one-second context on each available side, four
-  ASR workers, validated stitching, Korean translation, bilingual subtitles,
-  and optional hard-sub rendering are the reference workflow.
+- Whole-file stateful ASR with native word timestamps, five-second nominal
+  anchors, Korean translation, bilingual subtitles, and optional hard-sub
+  rendering are the reference workflow. One-second overlap, four workers, and
+  validated stitching remain the segmented compatibility workflow.
 - Nominal subtitle times must never overlap. Audio extraction windows may
   overlap and must be clamped to `[0, video_duration]`.
-- Preserve three separate facts: raw ASR output, stitched source text, and
-  translated text. Never overwrite raw evidence with a corrected value.
+- Preserve raw ASR, word times/confidence, reviewed source text, review
+  proposals, and translated text as separate facts. Never overwrite raw
+  evidence with a corrected value.
 - LLM stitching and translation must validate exact segment IDs, reject partial
   output, and retry boundedly. Never silently accept missing or duplicate IDs.
 - A failed ASR/LLM/render step must produce a nonzero exit rather than a
@@ -26,13 +28,15 @@ Guidance for humans and coding agents working in this repository.
   placeholder hosts and generic environment names.
 - Remote audio upload requires explicit approval through
   `--allow-audio-upload`; local command and loopback providers do not.
+- Remote frame review requires separate `--allow-frame-upload`. Proposal-only
+  is the safe default; visual-context proposals must never auto-apply.
 - Manifests may record provider/model identity but must not record credentials
   or the private endpoint URL.
 
 ## Provider contracts
 
-- OpenAI-compatible ASR accepts a multipart WAV upload and returns JSON with a
-  `text` field.
+- Whole-mode OpenAI-compatible ASR returns `text` plus timestamped `words`;
+  confidence is optional. Segmented mode accepts a text-only JSON response.
 - Command ASR templates support `{audio}` and `{model}` and must print either
   plain transcript text or JSON containing `text`/`transcript`.
 - Command LLM providers receive the complete prompt on stdin, support `{model}`
@@ -66,4 +70,3 @@ Guidance for humans and coding agents working in this repository.
 - Add known quality or hardware limitations to `docs/LIMITATIONS.md` rather
   than hiding them in implementation comments.
 - Add deferred product features to `docs/FUTURE_WORK.md` with acceptance notes.
-

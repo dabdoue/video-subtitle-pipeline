@@ -9,6 +9,7 @@ video
   -> one continuous audio track
   -> stateful ASR + native word timestamps
   -> timestamp assignment into nominal anchors
+  -> optional low-confidence frame review proposals
   -> optional translation
   -> timed cues
   -> SRT + manifest
@@ -31,6 +32,26 @@ The bundled Nemotron Transformers server uses cache-aware stateful streaming
 inside a single request, so long media does not require unbounded encoder
 activations. Its padded final inference chunk is clipped to the true media
 duration before transcript text is reconstructed.
+
+## Decoder confidence
+
+The bundled server captures the maximum softmax value at each greedy RNNT
+generation step. Blank/special emissions are removed, remaining scores align
+with timestamped emitted tokens, and word confidence is the minimum of its
+token scores. The response labels this `rnnt_max_softmax` with `min`
+aggregation and records that it is not a calibrated probability.
+
+## Frame-assisted review
+
+Segments with a word below the configured threshold are grouped into bounded
+batches. One PNG per segment is sampled at the lowest-confidence word midpoint.
+A Codex vision call receives frames, source/neighbor text, timing, and scores
+through a strict output schema.
+
+Each proposal records frame time/hash, model, threshold, original/proposed
+text, rationale, evidence class, and apply decision. `raw_asr_text` and
+`asr_words` never change. Proposal-only is the default; generic visual context
+cannot auto-apply even when applying is explicitly enabled.
 
 ## Segmented nominal anchors versus ASR windows
 
@@ -79,7 +100,9 @@ Each manifest segment has:
   "raw_asr_text": "...",
   "asr_audio_start": 4.0,
   "asr_audio_end": 11.0,
+  "asr_words": [{"word": "robot", "start": 5.1, "end": 5.4, "confidence": 0.42}],
   "text": "stitched source text",
+  "visual_review": null,
   "translation_parts": ["translated text"]
 }
 ```

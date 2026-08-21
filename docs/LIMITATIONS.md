@@ -6,6 +6,9 @@
   text-only or superficially OpenAI-compatible endpoint must use segmented mode.
 - Timestamp accuracy is limited to the ASR encoder frame rate and word
   aggregation. It is alignment evidence, not a human-verified boundary.
+- Decoder confidence is not calibrated. Thresholds must be tuned against
+  reviewed recordings for the particular model, language, microphone, and
+  domain.
 - ASR systems may emit different spellings for the same overlapped phrase. An
   LLM can reconcile many cases, but neither the LLM nor deterministic fallback
   can guarantee the true wording.
@@ -27,6 +30,19 @@
   project glossary or whole-video terminology memory.
 - Free hosted models can change, rate-limit, disappear, or return weaker JSON.
   Structured-output reliability matters as much as translation quality.
+
+## Visual review
+
+- A single frame cannot establish what was spoken. It can show stale, nearby,
+  or unrelated interface text.
+- Vision models can misread or invent labels. In validation, one model call
+  invented a useful-looking label while another grounded an incorrect
+  transcript replacement in genuinely visible layout text.
+- Proposal-only is therefore the default. Generic visual-context proposals are
+  never auto-applied; visible-text proposals still require explicit opt-in and
+  human validation.
+- The frame may land during motion blur or a transition. Scene-aware sampling
+  and independent OCR verification remain future work.
 
 ## Timing
 
@@ -66,5 +82,7 @@
   receives extracted windows. The video container itself is not uploaded.
 - Translation/stitch providers receive transcript text, timing, and model
   prompts. They do not receive video or audio unless a custom provider does so.
+- Visual review sends selected still frames only after `--allow-frame-upload`;
+  it does not send the video container.
 - Local config and `.env` are ignored, but users must still inspect `git status`
   before publishing.

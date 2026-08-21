@@ -145,13 +145,16 @@ class TimestampedASRTests(unittest.TestCase):
                 "words": [
                     {"word": "Move", "start": 0.8, "end": 1.1},
                     {"word": "the", "start": 1.1, "end": 1.3},
-                    {"word": "robot", "start": 4.8, "end": 5.2},
+                    {"word": "robot", "start": 4.8, "end": 5.2, "confidence": 0.42},
                     {"word": "arm.", "start": 5.2, "end": 5.6},
                 ],
+                "confidence_metadata": {"method": "rnnt_max_softmax"},
             }
         )
         self.assertEqual(result.duration, 6.0)
         self.assertEqual(result.words[2].word, "robot")
+        self.assertEqual(result.words[2].confidence, 0.42)
+        self.assertEqual(result.confidence_metadata["method"], "rnnt_max_softmax")
 
     def test_parse_rejects_text_only_response(self) -> None:
         with self.assertRaisesRegex(pipeline.PipelineError, "did not return word timestamps"):
@@ -193,6 +196,137 @@ class TimestampedASRTests(unittest.TestCase):
         self.assertEqual(segments[1].text, "second")
 
 
+class VisualReviewTests(unittest.TestCase):
+    def test_low_confidence_review_keeps_raw_evidence_and_applies_proposal(self) -> None:
+        segments = [
+            pipeline.Segment(
+                "1",
+                0,
+                5,
+                text="Open the labor tab.",
+                raw_asr_text="Open the labor tab.",
+                asr_words=[pipeline.ASRWord("labor", 2.0, 2.4, 0.2)],
+            ),
+            pipeline.Segment(
+                "2",
+                5,
+                10,
+                text="Then save it.",
+                raw_asr_text="Then save it.",
+                asr_words=[pipeline.ASRWord("save", 6.0, 6.3, 0.95)],
+            ),
+        ]
+
+        def fake_frame(_: Path, timestamp: float, destination: Path) -> None:
+            self.assertAlmostEqual(timestamp, 2.2)
+            destination.write_bytes(b"frame")
+
+        def fake_llm(prompt: str, **kwargs: object) -> dict[str, dict[str, str]]:
+            self.assertIn("labor", prompt)
+            self.assertEqual(len(kwargs["images"]), 1)
+            return {
+                "1": {
+                    "action": "replace",
+                    "reviewed_text": "Open the labware tab.",
+                    "rationale": "The visible tab label reads Labware.",
+                    "evidence": "visible_text",
+                }
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(pipeline, "extract_video_frame", side_effect=fake_frame):
+                with mock.patch.object(pipeline, "run_llm_json", side_effect=fake_llm):
+                    applied = pipeline.review_low_confidence_segments(
+                        Path("video.mp4"),
+                        segments,
+                        threshold=0.6,
+                        provider="codex",
+                        model="test-luna",
+                        effort="low",
+                        batch_size=4,
+                        apply_changes=True,
+                        workdir=Path(directory),
+                    )
+        self.assertEqual(applied, 1)
+        self.assertEqual(segments[0].text, "Open the labware tab.")
+        self.assertEqual(segments[0].raw_asr_text, "Open the labor tab.")
+        self.assertTrue(segments[0].visual_review["applied"])
+        self.assertIsNone(segments[1].visual_review)
+
+    def test_codex_json_runner_attaches_images(self) -> None:
+        commands: list[list[str]] = []
+
+        def fake_run(command: list[str], **_: object) -> mock.Mock:
+            commands.append(command)
+            output = Path(command[command.index("--output-last-message") + 1])
+            output.write_text('{"segments":[{"id":"1","text":"ok"}]}', encoding="utf-8")
+            return mock.Mock(stdout="")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = root / "frame.png"
+            image.write_bytes(b"frame")
+            with mock.patch.object(pipeline, "run", side_effect=fake_run):
+                result = pipeline.run_llm_json(
+                    "review",
+                    provider="codex",
+                    model="test",
+                    effort="low",
+                    command_template=None,
+                    schema=pipeline.object_array_schema(
+                        ["1"], value_name="text", value_schema={"type": "string"}
+                    ),
+                    workdir=root,
+                    label="image-test",
+                    validator=lambda payload: pipeline.parse_exact_items(
+                        payload, ["1"], "text"
+                    ),
+                    images=[image],
+                )
+        self.assertEqual(result, {"1": "ok"})
+        self.assertIn("--image", commands[0])
+        self.assertIn(str(image), commands[0])
+
+    def test_visual_context_proposal_is_never_auto_applied(self) -> None:
+        segment = pipeline.Segment(
+            "1",
+            0,
+            5,
+            text="Open the labor tab.",
+            raw_asr_text="Open the labor tab.",
+            asr_words=[pipeline.ASRWord("labor", 2.0, 2.4, 0.2)],
+        )
+
+        def fake_frame(_: Path, timestamp: float, destination: Path) -> None:
+            destination.write_bytes(b"frame")
+
+        proposal = {
+            "1": {
+                "action": "replace",
+                "reviewed_text": "Open the layout tab.",
+                "rationale": "The screen shows a layout.",
+                "evidence": "visual_context",
+            }
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(pipeline, "extract_video_frame", side_effect=fake_frame):
+                with mock.patch.object(pipeline, "run_llm_json", return_value=proposal):
+                    applied = pipeline.review_low_confidence_segments(
+                        Path("video.mp4"),
+                        [segment],
+                        threshold=0.6,
+                        provider="codex",
+                        model="test-luna",
+                        effort="low",
+                        batch_size=4,
+                        apply_changes=True,
+                        workdir=Path(directory),
+                    )
+        self.assertEqual(applied, 0)
+        self.assertEqual(segment.text, "Open the labor tab.")
+        self.assertFalse(segment.visual_review["applied"])
+
+
 class ConfigTests(unittest.TestCase):
     def test_config_loads_defaults_and_cli_overrides_them(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -207,6 +341,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(args.audio_overlap, 1.5)
         self.assertEqual(args.asr_workers, 7)
         self.assertEqual(args.asr_mode, "whole")
+        self.assertTrue(args.asr_confidence)
+        self.assertEqual(args.visual_review_provider, "none")
         self.assertTrue(args.burn)
 
     def test_unknown_config_key_is_rejected(self) -> None:

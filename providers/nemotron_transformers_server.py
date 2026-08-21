@@ -14,6 +14,7 @@ import re
 import subprocess
 import tempfile
 import time
+import types
 from pathlib import Path
 
 import numpy as np
@@ -135,10 +136,53 @@ def streaming_inputs(audio: np.ndarray, sample_rate: int, language: str):
     return inputs
 
 
-def words_from_tokens(token_timestamps: list[dict], duration: float) -> list[dict]:
+def generate_with_confidence(model, inputs: dict, enabled: bool):
+    if not enabled:
+        with torch.inference_mode():
+            return model.generate(**inputs), None
+
+    step_confidences: list[float] = []
+    original_update = model._update_model_kwargs_for_generation
+
+    def capture_update(self, outputs, model_kwargs, *args, **kwargs):
+        probabilities = outputs.logits[:, -1, :].detach().float().softmax(dim=-1)
+        step_confidences.append(float(probabilities.max(dim=-1).values[0].cpu()))
+        return original_update(outputs, model_kwargs, *args, **kwargs)
+
+    model._update_model_kwargs_for_generation = types.MethodType(capture_update, model)
+    try:
+        with torch.inference_mode():
+            output = model.generate(**inputs)
+    finally:
+        model._update_model_kwargs_for_generation = original_update
+    return output, step_confidences
+
+
+def emitted_token_confidences(model, processor, output, step_confidences):
+    if step_confidences is None:
+        return None
+    sequence = output.sequences[0].detach().cpu().tolist()[1:]
+    if len(sequence) != len(step_confidences):
+        raise RuntimeError("RNNT confidence steps did not align with generated tokens")
+    ignored = set(processor.tokenizer.all_special_ids) | {model.config.blank_token_id}
+    return [
+        confidence
+        for token_id, confidence in zip(sequence, step_confidences, strict=True)
+        if token_id not in ignored
+    ]
+
+
+def words_from_tokens(
+    token_timestamps: list[dict],
+    duration: float,
+    token_confidences: list[float] | None = None,
+) -> list[dict]:
+    if token_confidences is not None and len(token_confidences) != len(token_timestamps):
+        raise RuntimeError("RNNT confidence values did not align with timestamped emissions")
     text = ""
     character_times: list[tuple[float, float]] = []
-    for item in token_timestamps:
+    character_confidences: list[float | None] = []
+    for index, item in enumerate(token_timestamps):
         token = str(item.get("token", ""))
         start = max(0.0, float(item["start"]))
         end = min(duration, float(item["end"]))
@@ -146,33 +190,45 @@ def words_from_tokens(token_timestamps: list[dict], duration: float) -> list[dic
             continue
         text += token
         character_times.extend([(start, end)] * len(token))
+        confidence = token_confidences[index] if token_confidences is not None else None
+        character_confidences.extend([confidence] * len(token))
 
     words = []
     for match in re.finditer(r"\S+", text):
         times = character_times[match.start() : match.end()]
-        words.append(
-            {
-                "word": match.group(0),
-                "start": round(min(start for start, _ in times), 3),
-                "end": round(max(end for _, end in times), 3),
-            }
-        )
+        word = {
+            "word": match.group(0),
+            "start": round(min(start for start, _ in times), 3),
+            "end": round(max(end for _, end in times), 3),
+        }
+        confidences = [
+            value
+            for value in character_confidences[match.start() : match.end()]
+            if value is not None
+        ]
+        if confidences:
+            word["confidence"] = round(min(confidences), 6)
+        words.append(word)
     return words
 
 
-def transcribe_audio(audio: np.ndarray, sample_rate: int, language: str) -> dict:
+def transcribe_audio(
+    audio: np.ndarray, sample_rate: int, language: str, include_confidence: bool
+) -> dict:
     model, processor = get_runtime()
     duration = len(audio) / sample_rate
     inputs = streaming_inputs(audio, sample_rate, language)
-    with torch.inference_mode():
-        output = model.generate(**inputs)
+    output, step_confidences = generate_with_confidence(model, inputs, include_confidence)
     _, timestamps = processor.decode(
         output.sequences,
         durations=output.durations,
         skip_special_tokens=True,
     )
     token_timestamps = timestamps[0] if timestamps and isinstance(timestamps[0], list) else timestamps
-    words = words_from_tokens(token_timestamps, duration)
+    token_confidences = emitted_token_confidences(
+        model, processor, output, step_confidences
+    )
+    words = words_from_tokens(token_timestamps, duration, token_confidences)
     text = " ".join(word["word"] for word in words).strip()
     return {"text": text, "words": words, "duration": duration}
 
@@ -201,6 +257,7 @@ async def health():
         "model": SERVED_NAME,
         "loaded": _model is not None,
         "word_timestamps": True,
+        "word_confidence": True,
         "lookahead_tokens": LOOKAHEAD_TOKENS,
     }
 
@@ -212,13 +269,16 @@ async def transcriptions(
     language: str = Form("auto"),
     response_format: str = Form("json"),
     timestamps: bool = Form(False),
+    confidence: bool = Form(False),
     timestamp_granularities: list[str] = Form(
         default=[], alias="timestamp_granularities[]"
     ),
 ):
     try:
         audio, sample_rate = decode_upload(await file.read())
-        result = transcribe_audio(audio, sample_rate, language or "auto")
+        result = transcribe_audio(
+            audio, sample_rate, language or "auto", include_confidence=confidence
+        )
     except Exception as exc:
         return JSONResponse(
             {"error": {"message": str(exc), "type": "asr_error"}}, status_code=503
@@ -232,7 +292,7 @@ async def transcriptions(
     verbose = response_format == "verbose_json" or timestamps or "word" in timestamp_granularities
     if not verbose:
         return base
-    return {
+    response = {
         **base,
         "duration": round(result["duration"], 3),
         "language": language or "auto",
@@ -248,6 +308,14 @@ async def transcriptions(
         if result["text"]
         else [],
     }
+    if confidence:
+        response["confidence_metadata"] = {
+            "level": "word",
+            "method": "rnnt_max_softmax",
+            "aggregation": "min",
+            "calibrated_probability": False,
+        }
+    return response
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
 import json
 import math
 import os
@@ -18,7 +19,7 @@ from typing import Any, Callable, Iterable, Sequence
 from urllib.parse import urlparse
 
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 DEFAULT_ASR_MODEL = "nvidia/nemotron-3.5-asr-streaming-0.6b"
 
 LANGUAGE_CODES = {
@@ -49,6 +50,7 @@ class ASRWord:
     word: str
     start: float
     end: float
+    confidence: float | None = None
 
 
 @dataclass
@@ -56,6 +58,7 @@ class ASRResult:
     text: str
     words: list[ASRWord] = field(default_factory=list)
     duration: float | None = None
+    confidence_metadata: dict[str, Any] | None = None
 
 
 @dataclass
@@ -69,6 +72,7 @@ class Segment:
     asr_audio_start: float | None = None
     asr_audio_end: float | None = None
     asr_words: list[ASRWord] = field(default_factory=list)
+    visual_review: dict[str, Any] | None = None
 
     @property
     def duration(self) -> float:
@@ -203,12 +207,22 @@ def parse_json_segments(path: Path) -> list[Segment]:
                         word=normalize_text(word.get("word", word.get("text", ""))),
                         start=float(word["start"]),
                         end=float(word["end"]),
+                        confidence=(
+                            float(word["confidence"])
+                            if word.get("confidence") is not None
+                            else None
+                        ),
                     )
                     for word in item.get("asr_words", [])
                     if isinstance(word, dict)
                     and word.get("start") is not None
                     and word.get("end") is not None
                 ],
+                visual_review=(
+                    dict(item["visual_review"])
+                    if isinstance(item.get("visual_review"), dict)
+                    else None
+                ),
             )
         )
     validate_segments(segments)
@@ -378,6 +392,7 @@ def transcribe_openai_compatible(
     url: str,
     model: str,
     api_key: str,
+    language: str = "auto",
 ) -> str:
     command = [
         "curl",
@@ -394,6 +409,8 @@ def transcribe_openai_compatible(
     if api_key:
         command.extend(["-H", f"Authorization: Bearer {api_key}"])
     command.extend(["-F", f"model={model}", "-F", f"file=@{audio};type=audio/wav"])
+    if language:
+        command.extend(["-F", f"language={language}"])
     result = run(command, capture=True)
     try:
         payload = json.loads(result.stdout)
@@ -427,12 +444,24 @@ def parse_asr_result(payload: Any) -> ASRResult:
             raise PipelineError(f"ASR word {index} has invalid timestamps") from exc
         if not text or start < 0 or end <= start:
             raise PipelineError(f"ASR word {index} has invalid text or range")
-        words.append(ASRWord(text, start, end))
+        confidence = item.get("confidence")
+        try:
+            confidence = float(confidence) if confidence is not None else None
+        except (TypeError, ValueError) as exc:
+            raise PipelineError(f"ASR word {index} has invalid confidence") from exc
+        if confidence is not None and not 0 <= confidence <= 1:
+            raise PipelineError(f"ASR word {index} confidence is outside [0, 1]")
+        words.append(ASRWord(text, start, end, confidence))
     words.sort(key=lambda word: (word.start, word.end))
     return ASRResult(
         text=normalize_text(payload.get("text")),
         words=words,
         duration=float(payload["duration"]) if payload.get("duration") is not None else None,
+        confidence_metadata=(
+            dict(payload["confidence_metadata"])
+            if isinstance(payload.get("confidence_metadata"), dict)
+            else None
+        ),
     )
 
 
@@ -442,6 +471,8 @@ def transcribe_openai_compatible_timestamped(
     url: str,
     model: str,
     api_key: str,
+    include_confidence: bool,
+    language: str,
 ) -> ASRResult:
     command = [
         "curl",
@@ -469,6 +500,10 @@ def transcribe_openai_compatible_timestamped(
             "timestamp_granularities[]=word",
         ]
     )
+    if include_confidence:
+        command.extend(["-F", "confidence=true"])
+    if language:
+        command.extend(["-F", f"language={language}"])
     result = run(command, capture=True)
     try:
         payload = json.loads(result.stdout)
@@ -554,7 +589,7 @@ def transcribe_whole_audio(
     workdir: Path,
     audio_stream: int,
     transcriber: Callable[[Path], ASRResult],
-) -> None:
+) -> ASRResult:
     audio = workdir / "whole-audio.wav"
     print(f"ASR: one stateful whole-file request ({duration:.2f}s)", flush=True)
     extract_audio_window(
@@ -564,7 +599,9 @@ def transcribe_whole_audio(
         destination=audio,
         audio_stream=audio_stream,
     )
-    assign_timestamped_words(segments, transcriber(audio), duration=duration)
+    result = transcriber(audio)
+    assign_timestamped_words(segments, result, duration=duration)
+    return result
 
 
 def transcribe_missing_segments(
@@ -759,6 +796,7 @@ def run_llm_json(
     workdir: Path,
     label: str,
     validator: Callable[[Any], dict[str, Any]],
+    images: Sequence[Path] = (),
 ) -> dict[str, Any]:
     last_error: PipelineError | None = None
     for attempt in range(1, 4):
@@ -775,26 +813,29 @@ def run_llm_json(
                 schema_path = workdir / f"{label.replace(' ', '-')}-{attempt}.schema.json"
                 output_path = workdir / f"{label.replace(' ', '-')}-{attempt}.json"
                 schema_path.write_text(json.dumps(schema, indent=2), encoding="utf-8")
+                command = [
+                    "codex",
+                    "exec",
+                    "--model",
+                    model,
+                    "--sandbox",
+                    "read-only",
+                    "--ephemeral",
+                    "--skip-git-repo-check",
+                    "--color",
+                    "never",
+                    "--config",
+                    f'model_reasoning_effort="{effort}"',
+                    "--output-schema",
+                    str(schema_path),
+                    "--output-last-message",
+                    str(output_path),
+                ]
+                for image in images:
+                    command.extend(["--image", str(image)])
+                command.append("-")
                 run(
-                    [
-                        "codex",
-                        "exec",
-                        "--model",
-                        model,
-                        "--sandbox",
-                        "read-only",
-                        "--ephemeral",
-                        "--skip-git-repo-check",
-                        "--color",
-                        "never",
-                        "--config",
-                        f'model_reasoning_effort="{effort}"',
-                        "--output-schema",
-                        str(schema_path),
-                        "--output-last-message",
-                        str(output_path),
-                        "-",
-                    ],
+                    command,
                     input_text=attempt_prompt,
                     cwd=workdir,
                 )
@@ -912,6 +953,227 @@ def stitch_transcripts(
             batch_size=batch_size,
             workdir=workdir,
         )
+
+
+def extract_video_frame(video: Path, timestamp: float, destination: Path) -> None:
+    run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            f"{timestamp:.3f}",
+            "-i",
+            str(video),
+            "-map",
+            "0:v:0",
+            "-frames:v",
+            "1",
+            "-y",
+            str(destination),
+        ]
+    )
+    if not destination.is_file() or destination.stat().st_size == 0:
+        raise PipelineError(f"FFmpeg did not produce review frame at {timestamp:.3f}s")
+
+
+def review_schema(ids: Sequence[str]) -> dict[str, Any]:
+    count = len(ids)
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["segments"],
+        "properties": {
+            "segments": {
+                "type": "array",
+                "minItems": count,
+                "maxItems": count,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "id",
+                        "action",
+                        "reviewed_text",
+                        "rationale",
+                        "evidence",
+                    ],
+                    "properties": {
+                        "id": {"type": "string", "enum": list(ids)},
+                        "action": {"type": "string", "enum": ["keep", "replace"]},
+                        "reviewed_text": {"type": "string"},
+                        "rationale": {"type": "string"},
+                        "evidence": {
+                            "type": "string",
+                            "enum": ["visible_text", "visual_context", "insufficient"],
+                        },
+                    },
+                },
+            }
+        },
+    }
+
+
+def parse_review_items(payload: Any, ids: Sequence[str]) -> dict[str, dict[str, str]]:
+    items = payload.get("segments") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        raise PipelineError("Visual reviewer response has no segments array")
+    result: dict[str, dict[str, str]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            raise PipelineError("Visual reviewer returned a non-object segment")
+        identifier = str(item.get("id", ""))
+        if identifier in result:
+            raise PipelineError(f"Visual reviewer returned duplicate segment id: {identifier}")
+        action = str(item.get("action", ""))
+        reviewed_text = normalize_text(item.get("reviewed_text", ""))
+        evidence = str(item.get("evidence", ""))
+        if action not in {"keep", "replace"}:
+            raise PipelineError(f"Visual reviewer returned invalid action for {identifier}")
+        if evidence not in {"visible_text", "visual_context", "insufficient"}:
+            raise PipelineError(f"Visual reviewer returned invalid evidence for {identifier}")
+        if action == "replace" and not reviewed_text:
+            raise PipelineError(f"Visual reviewer returned an empty replacement for {identifier}")
+        result[identifier] = {
+            "action": action,
+            "reviewed_text": reviewed_text,
+            "rationale": normalize_text(item.get("rationale", "")),
+            "evidence": evidence,
+        }
+    if set(result) != set(ids):
+        raise PipelineError(
+            f"Visual reviewer ids mismatch; expected={sorted(ids)}, actual={sorted(result)}"
+        )
+    return result
+
+
+def review_low_confidence_segments(
+    video: Path,
+    segments: Sequence[Segment],
+    *,
+    threshold: float,
+    provider: str,
+    model: str,
+    effort: str,
+    batch_size: int,
+    apply_changes: bool,
+    workdir: Path,
+) -> int:
+    targets = [
+        segment
+        for segment in segments
+        if any(
+            word.confidence is not None and word.confidence < threshold
+            for word in segment.asr_words
+        )
+    ]
+    if not targets:
+        print("Visual review: no words fell below the confidence threshold", flush=True)
+        return 0
+
+    segment_positions = {segment.id: index for index, segment in enumerate(segments)}
+    applied = 0
+    for batch_number, offset in enumerate(range(0, len(targets), batch_size), 1):
+        batch = targets[offset : offset + batch_size]
+        ids = [segment.id for segment in batch]
+        frames: list[Path] = []
+        records: list[dict[str, Any]] = []
+        frame_metadata: dict[str, dict[str, Any]] = {}
+        for image_index, segment in enumerate(batch, 1):
+            low_words = [
+                word
+                for word in segment.asr_words
+                if word.confidence is not None and word.confidence < threshold
+            ]
+            lowest = min(low_words, key=lambda word: word.confidence or 0.0)
+            timestamp = min(segment.end, max(segment.start, (lowest.start + lowest.end) / 2))
+            frame = workdir / f"review-{batch_number:03d}-{segment.id}.png"
+            extract_video_frame(video, timestamp, frame)
+            frame_hash = hashlib.sha256(frame.read_bytes()).hexdigest()
+            frames.append(frame)
+            position = segment_positions[segment.id]
+            neighbors = [
+                {"id": candidate.id, "text": candidate.text}
+                for candidate in segments[max(0, position - 1) : min(len(segments), position + 2)]
+                if candidate.id != segment.id
+            ]
+            low_payload = [asdict(word) for word in low_words]
+            records.append(
+                {
+                    "id": segment.id,
+                    "nominal_start": segment.start,
+                    "nominal_end": segment.end,
+                    "source_text": segment.text,
+                    "low_confidence_words": low_payload,
+                    "neighboring_source": neighbors,
+                    "attached_image_number": image_index,
+                    "frame_timestamp": round(timestamp, 3),
+                }
+            )
+            frame_metadata[segment.id] = {
+                "frame_timestamp": round(timestamp, 3),
+                "frame_sha256": frame_hash,
+                "low_confidence_words": low_payload,
+            }
+
+        prompt = textwrap.dedent(
+            f"""
+            Review low-confidence ASR text using the attached video frames as limited visual context.
+
+            Rules:
+            - Return only JSON matching the supplied schema and every requested id exactly once.
+            - Each record names its 1-based attached image number and exact frame timestamp.
+            - Preserve what was spoken. Do not translate, summarize, improve grammar, or move phrases between anchors.
+            - A frame cannot prove speech. Nearby or stale on-screen text may be unrelated.
+            - Replace text only when exact visible text supports an acoustically plausible correction to a low-confidence word.
+            - Generic scene meaning or visual_context may be mentioned in the rationale, but it must use action keep and cannot justify replacement.
+            - Keep the complete source_text unchanged when evidence is insufficient.
+            - When action is keep, reviewed_text must equal source_text.
+            - When action is replace, change only the minimum wording supported by the evidence.
+
+            Segments:
+            {json.dumps(records, ensure_ascii=False, separators=(',', ':'))}
+            """
+        ).strip()
+        result = run_llm_json(
+            prompt,
+            provider=provider,
+            model=model,
+            effort=effort,
+            command_template=None,
+            schema=review_schema(ids),
+            workdir=workdir,
+            label=f"visual-review-batch-{batch_number}",
+            validator=lambda payload, expected=ids: parse_review_items(payload, expected),
+            images=frames,
+        )
+        for segment in batch:
+            review = result[segment.id]
+            original = segment.text
+            proposed = review["reviewed_text"]
+            should_apply = (
+                apply_changes
+                and review["action"] == "replace"
+                and review["evidence"] == "visible_text"
+                and proposed != original
+            )
+            segment.visual_review = {
+                **frame_metadata[segment.id],
+                "provider": provider,
+                "model": model,
+                "threshold": threshold,
+                "original_text": original,
+                "proposed_text": proposed,
+                "action": review["action"],
+                "rationale": review["rationale"],
+                "evidence": review["evidence"],
+                "applied": should_apply,
+            }
+            if should_apply:
+                segment.text = proposed
+                applied += 1
+    return applied
 
 
 def drop_short_trailing_fragment(
@@ -1179,8 +1441,11 @@ def write_manifest(
         "asr": {
             "provider": args.asr_provider,
             "model": args.asr_model,
+            "language": args.asr_language,
             "mode": args.asr_mode,
             "timestamp_granularity": "word" if args.asr_mode == "whole" else None,
+            "confidence_requested": args.asr_confidence if args.asr_mode == "whole" else False,
+            "confidence_metadata": getattr(args, "asr_confidence_metadata", None),
             "endpoint_configured": (
                 bool(args.asr_url) if args.asr_provider == "openai-compatible" else False
             ),
@@ -1190,6 +1455,14 @@ def write_manifest(
             "provider": args.stitch_provider,
             "model": args.stitch_model if args.stitch_provider in {"codex", "command"} else None,
             "note": "Raw overlapping ASR text and extraction bounds are retained per segment.",
+        },
+        "visual_review": {
+            "provider": args.visual_review_provider,
+            "model": (
+                args.visual_review_model if args.visual_review_provider != "none" else None
+            ),
+            "confidence_threshold": args.visual_review_confidence_threshold,
+            "apply_changes": args.visual_review_apply,
         },
         "translation": {
             "provider": args.translate_provider,
@@ -1252,9 +1525,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--asr-url", default=os.environ.get("ASR_URL", ""))
     parser.add_argument("--asr-model", default=os.environ.get("ASR_MODEL", DEFAULT_ASR_MODEL))
+    parser.add_argument("--asr-language", default=os.environ.get("ASR_LANGUAGE", "auto"))
     parser.add_argument("--asr-api-key-env", default="ASR_API_KEY")
     parser.add_argument("--asr-command", help="Local command template; supports {audio} and {model}")
     parser.add_argument("--asr-workers", type=int, default=4)
+    parser.add_argument(
+        "--asr-confidence",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Request optional per-word decoder confidence in whole-file mode",
+    )
     parser.add_argument("--allow-audio-upload", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--allow-empty-text", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
@@ -1262,6 +1542,25 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--stitch-provider", choices=["codex", "command", "deterministic", "none"], default="codex")
     parser.add_argument("--stitch-model", default=os.environ.get("STITCH_MODEL", "gpt-5.6-luna"))
     parser.add_argument("--stitch-batch-size", type=int, default=40)
+
+    parser.add_argument(
+        "--visual-review-provider", choices=["none", "codex"], default="none"
+    )
+    parser.add_argument(
+        "--visual-review-model",
+        default=os.environ.get("VISUAL_REVIEW_MODEL", "gpt-5.6-luna"),
+    )
+    parser.add_argument("--visual-review-confidence-threshold", type=float, default=0.6)
+    parser.add_argument("--visual-review-batch-size", type=int, default=4)
+    parser.add_argument(
+        "--visual-review-apply", action=argparse.BooleanOptionalAction, default=False
+    )
+    parser.add_argument(
+        "--allow-frame-upload",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Explicitly allow selected video frames to be sent to a remote visual reviewer",
+    )
 
     parser.add_argument("--translation-file", type=Path)
     parser.add_argument("--translated-segment", action="append", default=[], metavar="ID=TEXT")
@@ -1320,6 +1619,7 @@ def execute(args: argparse.Namespace) -> int:
         args.minimum_anchor_seconds,
         args.asr_workers,
         args.stitch_batch_size,
+        args.visual_review_batch_size,
         args.translation_batch_size,
         args.max_parts,
     ]
@@ -1327,9 +1627,12 @@ def execute(args: argparse.Namespace) -> int:
         any(value <= 0 for value in positive)
         or args.audio_overlap < 0
         or args.minimum_tail_text_chars < 0
+        or not 0 <= args.visual_review_confidence_threshold <= 1
     ):
-        raise PipelineError("Durations, worker counts, batch sizes, and part counts must be positive; overlap may be zero")
-
+        raise PipelineError(
+            "Durations, worker counts, batch sizes, and part counts must be positive; "
+            "overlap may be zero and confidence threshold must be in [0, 1]"
+        )
     require_commands(["ffmpeg", "ffprobe"])
     video_info = probe_video(args.video)
     if args.audio_stream >= len(video_info["audio_streams"]):
@@ -1360,6 +1663,7 @@ def execute(args: argparse.Namespace) -> int:
                     "asr_provider": args.asr_provider,
                     "asr_mode": args.asr_mode,
                     "stitch_provider": args.stitch_provider,
+                    "visual_review_provider": args.visual_review_provider,
                     "translation_provider": args.translate_provider,
                     "burn": args.burn,
                 },
@@ -1367,6 +1671,12 @@ def execute(args: argparse.Namespace) -> int:
             )
         )
         return 0
+
+    if args.visual_review_provider != "none" and not args.allow_frame_upload:
+        raise PipelineError(
+            "Visual review requires --allow-frame-upload because selected video frames "
+            "may be sent to the configured model provider"
+        )
 
     env_file = load_env_file(args.env_file)
     temporary: tempfile.TemporaryDirectory[str] | None
@@ -1394,6 +1704,8 @@ def execute(args: argparse.Namespace) -> int:
                         url=args.asr_url,
                         model=args.asr_model,
                         api_key=api_key,
+                        include_confidence=args.asr_confidence,
+                        language=args.asr_language,
                     )
                 else:
                     segment_transcriber = lambda audio: transcribe_openai_compatible(
@@ -1401,6 +1713,7 @@ def execute(args: argparse.Namespace) -> int:
                         url=args.asr_url,
                         model=args.asr_model,
                         api_key=api_key,
+                        language=args.asr_language,
                     )
             else:
                 if not args.asr_command:
@@ -1415,7 +1728,7 @@ def execute(args: argparse.Namespace) -> int:
                         audio, template=command_template, model=args.asr_model
                     )
             if args.asr_mode == "whole":
-                transcribe_whole_audio(
+                asr_result = transcribe_whole_audio(
                     args.video,
                     segments,
                     duration=video_info["duration"],
@@ -1423,6 +1736,7 @@ def execute(args: argparse.Namespace) -> int:
                     audio_stream=args.audio_stream,
                     transcriber=whole_transcriber,
                 )
+                args.asr_confidence_metadata = asr_result.confidence_metadata
             else:
                 transcribe_missing_segments(
                     args.video,
@@ -1452,6 +1766,20 @@ def execute(args: argparse.Namespace) -> int:
                     f"{segments[-1].id}: {tail_text!r}",
                     flush=True,
                 )
+
+        if args.visual_review_provider != "none":
+            applied = review_low_confidence_segments(
+                args.video,
+                segments,
+                threshold=args.visual_review_confidence_threshold,
+                provider=args.visual_review_provider,
+                model=args.visual_review_model,
+                effort=args.reasoning_effort,
+                batch_size=args.visual_review_batch_size,
+                apply_changes=args.visual_review_apply,
+                workdir=workdir,
+            )
+            print(f"Visual review applied {applied} correction(s)", flush=True)
 
         if args.translate_provider != "none":
             translate_segments(

@@ -38,17 +38,13 @@ Acceptance notes:
 
 ## ASR confidence and alternate streaming providers
 
-- Add provider capabilities for frame-, token-, and word-level ASR confidence.
-  NeMo RNNT decoding can be configured to preserve these scores, but the
-  default Nemotron response is text-only and not every serving adapter exposes
-  the richer hypothesis data.
-- Preserve word confidence and its calculation metadata in the manifest,
-  including the method (`max_prob` or normalized entropy), word aggregation,
-  model/runtime version, and whether the value came directly from the decoder.
-- Use confidence to flag likely review points and prioritize context-assisted
-  correction. Do not treat a decoder score as a calibrated probability that a
-  word is correct; establish useful thresholds against reviewed, in-domain
-  recordings first.
+- Extend confidence support beyond the bundled Nemotron Transformers server.
+- Add optional beam/N-best sequence decoding and auditable word alternatives.
+  Greedy top-token scores are not a word candidate list: in one validation, the
+  `wa` branch needed for `labware` ranked 40th at the `labor` divergence point,
+  so a small top-k list would not have recovered it.
+- Compare custom greedy maximum-softmax confidence with NeMo's configured
+  maximum-probability and entropy confidence methods on reviewed data.
 - Extend native whole-file timestamps and stateful streaming beyond the bundled
   Nemotron Transformers server to command and hosted providers.
 - Benchmark independent-window overlap against cache-aware streaming quality.
@@ -64,36 +60,23 @@ Useful references:
 
 ## Frame-assisted transcript review
 
-Status: documented, not implemented.
+Status: initial confidence-selected Codex image review implemented.
 
-- Extract a representative video frame for each selected segment, initially at
-  its nominal midpoint, with a later scene-aware option to avoid transitions or
-  blank frames.
-- Pass the frame, raw overlapping ASR, neighboring source text, timestamps, and
-  glossary to a vision-capable Luna/Codex review call. Visible application tabs,
-  labels, diagrams, and demonstrated objects can then support corrections such
-  as a domain term that sounds similar to a common word.
+- Add scene-aware multi-frame sampling to avoid transitions, motion blur, and a
+  misleading single instant.
+- Add independent OCR verification before any visible-text proposal can become
+  eligible for automatic application.
 - Make this provider-capability-driven: retain a text-only review fallback when
   the selected model or CLI path cannot accept images.
-- Ask the reviewer for structured correction proposals containing the segment
-  ID, original text, proposed text, rationale, and evidence type (`audio`,
-  `neighbor`, `visible_text`, `visual_context`, or `glossary`).
-- Never replace `raw_asr_text`. Apply a visual correction only to the reviewed
-  source-text field, and retain the proposal and provenance in the manifest.
-- Treat visible text as supporting context, not proof of speech. A frame may
-  show a nearby control or stale screen that the speaker did not actually name.
-- Prefer sending frames only for low-confidence words, glossary conflicts, or
-  manually selected segments so review cost and image disclosure stay bounded.
+- Add glossary locks and manual segment selection alongside confidence-based
+  targeting.
 
 Acceptance notes:
 
-- The sampled frame timestamp and a reproducible frame hash are recorded.
-- Corrections are traceable to raw ASR and can be accepted, rejected, or
-  reverted without retranscription.
-- A validation fixture covers a visually disambiguated domain term and another
-  case where misleading on-screen text must not change the transcript.
-- Private videos are not sent to a remote vision provider without the same
-  explicit upload permission used for remote audio.
+- Build a reviewer UI to accept/reject proposals and rerender without
+  retranscription.
+- Validate multi-frame/OCR gating against both a true visible correction and a
+  misleading on-screen term.
 
 ## Human review workflow
 
