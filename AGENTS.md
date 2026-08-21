@@ -6,10 +6,11 @@ Guidance for humans and coding agents working in this repository.
 
 - This repository is a standalone video transcription/translation tool. Do not
   add dependencies on the original Modelythic router checkout.
-- Whole-file stateful ASR with native word timestamps, five-second nominal
-  anchors, Korean translation, bilingual subtitles, and optional hard-sub
-  rendering are the reference workflow. One-second overlap, four workers, and
-  validated stitching remain the segmented compatibility workflow.
+- Whole-file ASR with native word timestamps, memory-aware offline/streaming
+  selection, five-second nominal anchors, Korean translation, bilingual
+  subtitles, and optional hard-sub rendering are the reference workflow.
+  One-second overlap, four workers, and validated stitching remain the
+  segmented compatibility workflow.
 - Nominal subtitle times must never overlap. Audio extraction windows may
   overlap and must be clamped to `[0, video_duration]`.
 - Preserve raw ASR, word times/confidence, reviewed source text, review
@@ -36,7 +37,9 @@ Guidance for humans and coding agents working in this repository.
 ## Provider contracts
 
 - Whole-mode OpenAI-compatible ASR returns `text` plus timestamped `words`;
-  confidence is optional. Segmented mode accepts a text-only JSON response.
+  confidence and runtime metadata are optional. Segmented mode accepts a
+  text-only JSON response. Nonstandard runtime form fields must remain opt-in
+  for compatibility with generic OpenAI-style providers.
 - Command ASR templates support `{audio}` and `{model}` and must print either
   plain transcript text or JSON containing `text`/`transcript`.
 - Command LLM providers receive the complete prompt on stdin, support `{model}`

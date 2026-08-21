@@ -90,6 +90,10 @@ Acceptance notes:
 
 - Incremental checkpoints and resume after interruption.
 - Directory/ZIP batch command with bounded disk usage.
+- Add a multi-request scheduler that batches independent recordings/streams on
+  the GPU; keep this distinct from single-recording offline input duration.
+- Add SSE or WebSocket partial transcripts for clients that need visible
+  real-time feedback from the streaming runtime.
 - Provider health checks and capability discovery.
 - Speaker diarization and accessible sound-event captions.
 - Quality metrics for duplicate overlap, missing translations, line density,

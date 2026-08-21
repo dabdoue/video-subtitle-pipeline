@@ -19,7 +19,7 @@ from typing import Any, Callable, Iterable, Sequence
 from urllib.parse import urlparse
 
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 DEFAULT_ASR_MODEL = "nvidia/nemotron-3.5-asr-streaming-0.6b"
 
 LANGUAGE_CODES = {
@@ -59,6 +59,7 @@ class ASRResult:
     words: list[ASRWord] = field(default_factory=list)
     duration: float | None = None
     confidence_metadata: dict[str, Any] | None = None
+    runtime_metadata: dict[str, Any] | None = None
 
 
 @dataclass
@@ -462,6 +463,11 @@ def parse_asr_result(payload: Any) -> ASRResult:
             if isinstance(payload.get("confidence_metadata"), dict)
             else None
         ),
+        runtime_metadata=(
+            dict(payload["runtime_metadata"])
+            if isinstance(payload.get("runtime_metadata"), dict)
+            else None
+        ),
     )
 
 
@@ -473,6 +479,9 @@ def transcribe_openai_compatible_timestamped(
     api_key: str,
     include_confidence: bool,
     language: str,
+    runtime: str,
+    memory_limit_gb: float | None,
+    max_offline_seconds: float | None,
 ) -> ASRResult:
     command = [
         "curl",
@@ -500,10 +509,16 @@ def transcribe_openai_compatible_timestamped(
             "timestamp_granularities[]=word",
         ]
     )
+    if runtime != "provider-default":
+        command.extend(["-F", f"runtime={runtime}"])
     if include_confidence:
         command.extend(["-F", "confidence=true"])
     if language:
         command.extend(["-F", f"language={language}"])
+    if memory_limit_gb is not None:
+        command.extend(["-F", f"memory_limit_gb={memory_limit_gb}"])
+    if max_offline_seconds is not None:
+        command.extend(["-F", f"max_offline_seconds={max_offline_seconds}"])
     result = run(command, capture=True)
     try:
         payload = json.loads(result.stdout)
@@ -1446,6 +1461,14 @@ def write_manifest(
             "timestamp_granularity": "word" if args.asr_mode == "whole" else None,
             "confidence_requested": args.asr_confidence if args.asr_mode == "whole" else False,
             "confidence_metadata": getattr(args, "asr_confidence_metadata", None),
+            "runtime_requested": args.asr_runtime if args.asr_mode == "whole" else None,
+            "runtime_metadata": getattr(args, "asr_runtime_metadata", None),
+            "memory_limit_gb": (
+                args.asr_memory_limit_gb if args.asr_mode == "whole" else None
+            ),
+            "max_offline_seconds": (
+                args.asr_max_offline_seconds if args.asr_mode == "whole" else None
+            ),
             "endpoint_configured": (
                 bool(args.asr_url) if args.asr_provider == "openai-compatible" else False
             ),
@@ -1529,6 +1552,22 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--asr-api-key-env", default="ASR_API_KEY")
     parser.add_argument("--asr-command", help="Local command template; supports {audio} and {model}")
     parser.add_argument("--asr-workers", type=int, default=4)
+    parser.add_argument(
+        "--asr-runtime",
+        choices=["provider-default", "auto", "throughput", "streaming"],
+        default="provider-default",
+        help="Provider execution policy for whole-file ASR",
+    )
+    parser.add_argument(
+        "--asr-memory-limit-gb",
+        type=float,
+        help="Maximum estimated incremental GPU memory for offline whole-file ASR",
+    )
+    parser.add_argument(
+        "--asr-max-offline-seconds",
+        type=float,
+        help="Force streaming above this duration; provider default applies when omitted",
+    )
     parser.add_argument(
         "--asr-confidence",
         action=argparse.BooleanOptionalAction,
@@ -1627,6 +1666,8 @@ def execute(args: argparse.Namespace) -> int:
         any(value <= 0 for value in positive)
         or args.audio_overlap < 0
         or args.minimum_tail_text_chars < 0
+        or (args.asr_memory_limit_gb is not None and args.asr_memory_limit_gb <= 0)
+        or (args.asr_max_offline_seconds is not None and args.asr_max_offline_seconds <= 0)
         or not 0 <= args.visual_review_confidence_threshold <= 1
     ):
         raise PipelineError(
@@ -1662,6 +1703,9 @@ def execute(args: argparse.Namespace) -> int:
                     "audio_overlap_seconds": args.audio_overlap,
                     "asr_provider": args.asr_provider,
                     "asr_mode": args.asr_mode,
+                    "asr_runtime": args.asr_runtime if args.asr_mode == "whole" else None,
+                    "asr_memory_limit_gb": args.asr_memory_limit_gb,
+                    "asr_max_offline_seconds": args.asr_max_offline_seconds,
                     "stitch_provider": args.stitch_provider,
                     "visual_review_provider": args.visual_review_provider,
                     "translation_provider": args.translate_provider,
@@ -1706,6 +1750,9 @@ def execute(args: argparse.Namespace) -> int:
                         api_key=api_key,
                         include_confidence=args.asr_confidence,
                         language=args.asr_language,
+                        runtime=args.asr_runtime,
+                        memory_limit_gb=args.asr_memory_limit_gb,
+                        max_offline_seconds=args.asr_max_offline_seconds,
                     )
                 else:
                     segment_transcriber = lambda audio: transcribe_openai_compatible(
@@ -1737,6 +1784,7 @@ def execute(args: argparse.Namespace) -> int:
                     transcriber=whole_transcriber,
                 )
                 args.asr_confidence_metadata = asr_result.confidence_metadata
+                args.asr_runtime_metadata = asr_result.runtime_metadata
             else:
                 transcribe_missing_segments(
                     args.video,

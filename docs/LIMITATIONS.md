@@ -19,6 +19,15 @@
 - The bundled Nemotron server preserves encoder state across internal chunks.
   Independent segmented HTTP/CLI requests do not; overlap remains a workaround
   for those providers.
+- Offline memory selection is estimated from a configurable fixed cost and
+  duration slope. Other audio content, library versions, attention backends,
+  concurrent GPU work, and allocator fragmentation can change the true peak.
+  The server falls back after a CUDA OOM, but operators should calibrate the
+  estimate on their own hardware. The default estimate targets reserved VRAM,
+  which can be materially higher than PyTorch's live allocated-tensor counter.
+- The bundled endpoint currently serializes inference and returns completed
+  JSON. It does not yet batch unrelated recordings or emit progressive partial
+  captions over SSE/WebSocket.
 
 ## Stitching and translation
 

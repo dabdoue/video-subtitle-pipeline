@@ -103,15 +103,22 @@ Transformers version. This repository supplies `providers/nemotron_transformers.
 as a segmented command adapter and `providers/nemotron_transformers_server.py`
 as a timestamp/confidence-capable HTTP server.
 
-The HTTP server uses Nemotron's cache-aware streaming path inside one request,
-returns native word timestamps, and clips its padded final inference chunk to
-the true audio duration. With `confidence=true`, it also captures greedy RNNT
-maximum-softmax scores and aggregates each word with the minimum token score:
+The HTTP server supports offline full-spectrogram and cache-aware streaming
+execution inside one request. Both return native word timestamps. Streaming
+clips its padded final chunk to the true audio duration. With `confidence=true`,
+both paths capture greedy RNNT maximum-softmax scores and aggregate each word
+with the minimum token score:
 
 ```bash
 export NEMOTRON_MODEL_DIR=/path/to/nemotron-3.5-asr-streaming-0.6b
 export NEMOTRON_SERVED_NAME=nemotron-3.5-asr
 export NEMOTRON_LOOKAHEAD_TOKENS=13
+export NEMOTRON_RUNTIME=auto
+export NEMOTRON_AUTO_MAX_OFFLINE_SECONDS=900
+export NEMOTRON_MEMORY_RESERVE_GB=1
+export NEMOTRON_OFFLINE_FIXED_MIB=256
+export NEMOTRON_OFFLINE_MIB_PER_SECOND=12
+export NEMOTRON_RELEASE_OFFLINE_CACHE=true
 export CUDA_VISIBLE_DEVICES=0
 python providers/nemotron_transformers_server.py
 ```
@@ -120,6 +127,17 @@ Then use `--asr-mode whole` with
 `http://127.0.0.1:1239/v1/audio/transcriptions`. Lookahead 13 corresponds to
 the model's highest documented streaming latency/accuracy setting (1120 ms);
 interactive applications may prefer a smaller supported value.
+
+The fixed and per-second memory values are conservative policy inputs, not
+model constants. Calibrate them with representative durations on the deployed
+GPU. The default server releases unused cached blocks after offline inference
+so a large request does not retain its full reserved peak; disabling that can
+improve repeated same-size throughput at the cost of steady VRAM. A request can
+override policy with `runtime`, `memory_limit_gb`, and
+`max_offline_seconds` multipart fields; the main CLI exposes these as
+`--asr-runtime`, `--asr-memory-limit-gb`, and
+`--asr-max-offline-seconds`. `throughput` bypasses only the automatic duration
+cap, not explicit limits or the CUDA-OOM streaming fallback.
 
 Set `--asr-language` to a known locale such as `en-US` when possible; `auto`
 uses Nemotron's language-detection prompt. See [Performance](PERFORMANCE.md) for

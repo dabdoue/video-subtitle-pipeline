@@ -9,10 +9,12 @@ environment variables so private paths and deployment details stay local.
 from __future__ import annotations
 
 import io
+import gc
 import os
 import re
 import subprocess
 import tempfile
+import threading
 import time
 import types
 from pathlib import Path
@@ -23,16 +25,34 @@ import torch
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import JSONResponse
 
+try:
+    from .nemotron_runtime_policy import choose_runtime
+except ImportError:
+    from nemotron_runtime_policy import choose_runtime
+
 
 MODEL_DIR = os.environ.get(
     "NEMOTRON_MODEL_DIR", "nvidia/nemotron-3.5-asr-streaming-0.6b"
 )
 SERVED_NAME = os.environ.get("NEMOTRON_SERVED_NAME", "nemotron-3.5-asr")
 LOOKAHEAD_TOKENS = int(os.environ.get("NEMOTRON_LOOKAHEAD_TOKENS", "13"))
+DEFAULT_RUNTIME = os.environ.get("NEMOTRON_RUNTIME", "auto")
+AUTO_MAX_OFFLINE_SECONDS = float(
+    os.environ.get("NEMOTRON_AUTO_MAX_OFFLINE_SECONDS", "900")
+)
+MEMORY_RESERVE_GB = float(os.environ.get("NEMOTRON_MEMORY_RESERVE_GB", "1"))
+OFFLINE_FIXED_MIB = float(os.environ.get("NEMOTRON_OFFLINE_FIXED_MIB", "256"))
+OFFLINE_MIB_PER_SECOND = float(
+    os.environ.get("NEMOTRON_OFFLINE_MIB_PER_SECOND", "12")
+)
+RELEASE_OFFLINE_CACHE = os.environ.get(
+    "NEMOTRON_RELEASE_OFFLINE_CACHE", "true"
+).casefold() not in {"0", "false", "no"}
 
 app = FastAPI(title="Nemotron 3.5 timestamped ASR")
 _model = None
 _processor = None
+_inference_lock = threading.Lock()
 
 
 def get_runtime():
@@ -133,7 +153,18 @@ def streaming_inputs(audio: np.ndarray, sample_rate: int, language: str):
 
     inputs = dict(first)
     inputs["input_features"] = feature_generator()
+    inputs["num_lookahead_tokens"] = LOOKAHEAD_TOKENS
     return inputs
+
+
+def offline_inputs(audio: np.ndarray, sample_rate: int, language: str):
+    model, processor = get_runtime()
+    return processor(
+        audio,
+        sampling_rate=sample_rate,
+        language=language,
+        return_tensors="pt",
+    ).to(model.device, dtype=model.dtype)
 
 
 def generate_with_confidence(model, inputs: dict, enabled: bool):
@@ -213,12 +244,57 @@ def words_from_tokens(
 
 
 def transcribe_audio(
-    audio: np.ndarray, sample_rate: int, language: str, include_confidence: bool
+    audio: np.ndarray,
+    sample_rate: int,
+    language: str,
+    include_confidence: bool,
+    requested_runtime: str,
+    memory_limit_gb: float | None,
+    max_offline_seconds: float | None,
 ) -> dict:
     model, processor = get_runtime()
     duration = len(audio) / sample_rate
-    inputs = streaming_inputs(audio, sample_rate, language)
-    output, step_confidences = generate_with_confidence(model, inputs, include_confidence)
+    free_gpu_bytes, _ = torch.cuda.mem_get_info(model.device)
+    decision = choose_runtime(
+        requested_runtime,
+        duration_seconds=duration,
+        free_gpu_bytes=free_gpu_bytes,
+        memory_limit_gb=memory_limit_gb,
+        max_offline_seconds=max_offline_seconds,
+        auto_max_offline_seconds=AUTO_MAX_OFFLINE_SECONDS,
+        reserve_gb=MEMORY_RESERVE_GB,
+        offline_fixed_mib=OFFLINE_FIXED_MIB,
+        offline_mib_per_second=OFFLINE_MIB_PER_SECOND,
+    )
+    actual_runtime = decision.selected
+    fallback_reason = None
+    allocated_before = torch.cuda.memory_allocated(model.device)
+    reserved_before = torch.cuda.memory_reserved(model.device)
+    started = time.perf_counter()
+    torch.cuda.reset_peak_memory_stats(model.device)
+    try:
+        inputs = (
+            offline_inputs(audio, sample_rate, language)
+            if actual_runtime == "offline"
+            else streaming_inputs(audio, sample_rate, language)
+        )
+        output, step_confidences = generate_with_confidence(
+            model, inputs, include_confidence
+        )
+    except torch.OutOfMemoryError:
+        if actual_runtime != "offline":
+            raise
+        fallback_reason = "offline_cuda_out_of_memory"
+        actual_runtime = "streaming"
+        if "inputs" in locals():
+            del inputs
+        gc.collect()
+        torch.cuda.empty_cache()
+        inputs = streaming_inputs(audio, sample_rate, language)
+        output, step_confidences = generate_with_confidence(
+            model, inputs, include_confidence
+        )
+    elapsed = time.perf_counter() - started
     _, timestamps = processor.decode(
         output.sequences,
         durations=output.durations,
@@ -230,7 +306,34 @@ def transcribe_audio(
     )
     words = words_from_tokens(token_timestamps, duration, token_confidences)
     text = " ".join(word["word"] for word in words).strip()
-    return {"text": text, "words": words, "duration": duration}
+    peak_allocated = torch.cuda.max_memory_allocated(model.device)
+    peak_reserved = torch.cuda.max_memory_reserved(model.device)
+    runtime_metadata = {
+        **decision.metadata(),
+        "actual": actual_runtime,
+        "fallback_reason": fallback_reason,
+        "elapsed_seconds": round(elapsed, 4),
+        "real_time_factor": round(elapsed / duration, 6) if duration else None,
+        "allocated_before_mib": round(allocated_before / (1024**2), 1),
+        "reserved_before_mib": round(reserved_before / (1024**2), 1),
+        "peak_allocated_mib": round(peak_allocated / (1024**2), 1),
+        "peak_reserved_mib": round(peak_reserved / (1024**2), 1),
+        "lookahead_tokens": LOOKAHEAD_TOKENS if actual_runtime == "streaming" else None,
+        "cache_released": actual_runtime == "offline" and RELEASE_OFFLINE_CACHE,
+    }
+    if actual_runtime == "offline" and RELEASE_OFFLINE_CACHE:
+        del inputs, output
+        gc.collect()
+        torch.cuda.empty_cache()
+    runtime_metadata["reserved_after_mib"] = round(
+        torch.cuda.memory_reserved(model.device) / (1024**2), 1
+    )
+    return {
+        "text": text,
+        "words": words,
+        "duration": duration,
+        "runtime_metadata": runtime_metadata,
+    }
 
 
 @app.get("/v1/models")
@@ -259,6 +362,15 @@ async def health():
         "word_timestamps": True,
         "word_confidence": True,
         "lookahead_tokens": LOOKAHEAD_TOKENS,
+        "runtime_default": DEFAULT_RUNTIME,
+        "runtime_modes": ["auto", "throughput", "streaming"],
+        "auto_max_offline_seconds": AUTO_MAX_OFFLINE_SECONDS,
+        "memory_reserve_gb": MEMORY_RESERVE_GB,
+        "offline_memory_estimate": {
+            "fixed_mib": OFFLINE_FIXED_MIB,
+            "mib_per_second": OFFLINE_MIB_PER_SECOND,
+        },
+        "release_offline_cache": RELEASE_OFFLINE_CACHE,
     }
 
 
@@ -270,14 +382,29 @@ async def transcriptions(
     response_format: str = Form("json"),
     timestamps: bool = Form(False),
     confidence: bool = Form(False),
+    runtime: str = Form(DEFAULT_RUNTIME),
+    memory_limit_gb: float | None = Form(None),
+    max_offline_seconds: float | None = Form(None),
     timestamp_granularities: list[str] = Form(
         default=[], alias="timestamp_granularities[]"
     ),
 ):
     try:
         audio, sample_rate = decode_upload(await file.read())
-        result = transcribe_audio(
-            audio, sample_rate, language or "auto", include_confidence=confidence
+        with _inference_lock:
+            result = transcribe_audio(
+                audio,
+                sample_rate,
+                language or "auto",
+                include_confidence=confidence,
+                requested_runtime=runtime,
+                memory_limit_gb=memory_limit_gb,
+                max_offline_seconds=max_offline_seconds,
+            )
+    except ValueError as exc:
+        return JSONResponse(
+            {"error": {"message": str(exc), "type": "invalid_request"}},
+            status_code=400,
         )
     except Exception as exc:
         return JSONResponse(
@@ -297,6 +424,7 @@ async def transcriptions(
         "duration": round(result["duration"], 3),
         "language": language or "auto",
         "words": result["words"],
+        "runtime_metadata": result["runtime_metadata"],
         "segments": [
             {
                 "id": 0,

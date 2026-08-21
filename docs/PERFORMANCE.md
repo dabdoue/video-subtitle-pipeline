@@ -4,7 +4,59 @@ These are focused development measurements, not general model benchmarks.
 Provider version, PyTorch/Transformers build, GPU clocks, audio content,
 lookahead, concurrency, and request format can change the result.
 
-## Original versus timestamp/confidence server
+## Memory-aware offline policy validation
+
+Measured on 2026-08-21 with RTX 3090 GPUs, PyTorch 2.13.0+cu130,
+Transformers 5.15.0, fp16, and the same Nemotron 3.5 ASR checkpoint. The
+candidate and original text-only server ran sequentially on the same spare GPU.
+Wall time includes local HTTP upload/response handling. A 395.668-second real
+Labware recording was used alongside its 10-second prefix and a synthetic
+60-second repetition.
+
+| Case | Original text-only | Offline + timestamps/confidence | Offline timestamps, no confidence | Stateful streaming + confidence |
+|---|---:|---:|---:|---:|
+| Warm 10 s | 0.278 s mean of 3 | 0.238 s mean of 3 | 0.201 s mean of 3 | 0.576 s steady mean of 2 |
+| Warm 60 s | 1.990 / 1.272 s | 1.670 / 1.110 s | 0.955 / 0.923 s | 2.918 / 2.896 s |
+| Full 395.668 s | 9.924 s | 8.545 s deployed | not measured | 22.113 s |
+| Full peak | 1,796 MiB `nvidia-smi` | 5,986 MiB PyTorch reserved; 6,312 MiB `nvidia-smi` | not measured | 1,255 MiB PyTorch allocated |
+| GPU after request | approximately 1,556 MiB | 1,588 MiB with cache release | not measured | approximately 1,556 MiB |
+
+The first inference after switching execution mode or input shape can be
+slower while CUDA kernels and algorithms warm up. For example, the first
+10-second streaming call was 1.348 seconds before stabilizing near 0.576
+seconds. Both first and repeated 60-second measurements are shown rather than
+hiding that effect.
+
+Findings:
+
+- The deployed offline path was about 14% faster than the original text-only
+  shim on the full recording even while returning word timestamps and
+  confidence. Direct `AutoModelForRNNT` use also avoids some pipeline-wrapper
+  overhead.
+- Offline and streaming produced the exact same 1,023-word transcript on the
+  full recording. Corresponding word timestamps differed by at most 80 ms
+  (one encoder frame); mean absolute confidence difference was 0.00134 and the
+  maximum was 0.03633.
+- The original server independently reset context every 30 seconds. Its full
+  transcript was 5,585 characters versus 5,565 for both continuous modes; no
+  human ground truth was used here, so this is evidence of a difference, not a
+  WER claim.
+- Offline speed costs duration-dependent memory. The deployed policy estimates
+  `256 MiB + 12 MiB/s`, predicting 5,004 MiB incremental for the full file.
+  Observed `nvidia-smi` growth was about 4,756 MiB, so the estimate was roughly
+  5% conservative on this sample.
+- PyTorch's live allocated-tensor peak understated the CUDA caching allocator:
+  3,177 MiB allocated versus 5,986 MiB reserved. `nvidia-smi` reached 6,312
+  MiB including CUDA context/other process overhead. Memory policy therefore
+  targets reserved VRAM, not only allocated tensors.
+- With `NEMOTRON_RELEASE_OFFLINE_CACHE=true`, the full request returned GPU
+  usage to 1,588 MiB. Without release, the first candidate retained about
+  6,312 MiB after completion.
+- The endpoint still serializes a single model instance. True batching of
+  independent recordings/streams and progressive partial-response transport
+  remain separate future work.
+
+## Historical original versus streaming timestamp/confidence server
 
 Measured on an otherwise idle NVIDIA RTX 3090 (24 GB) using the same fp16
 Nemotron 3.5 ASR checkpoint. The original server used its text-only Transformers
@@ -39,6 +91,7 @@ Interpretation:
   than the original. This bounded behavior is the reason to prefer stateful
   streaming for full videos despite lower raw throughput.
 
-For interactive or high-throughput deployments, benchmark smaller lookahead
-values and confidence disabled. For this offline subtitle workflow, bounded
-memory and continuous context are prioritized over minimum latency.
+These measurements motivated the selectable policy above. Interactive use can
+still benchmark smaller lookahead values, while offline subtitle work now uses
+full-input decoding when the calibrated budget fits and bounded streaming when
+it does not.

@@ -149,12 +149,44 @@ class TimestampedASRTests(unittest.TestCase):
                     {"word": "arm.", "start": 5.2, "end": 5.6},
                 ],
                 "confidence_metadata": {"method": "rnnt_max_softmax"},
+                "runtime_metadata": {
+                    "requested": "auto",
+                    "actual": "offline",
+                    "reason": "offline_fits_budget",
+                },
             }
         )
         self.assertEqual(result.duration, 6.0)
         self.assertEqual(result.words[2].word, "robot")
         self.assertEqual(result.words[2].confidence, 0.42)
         self.assertEqual(result.confidence_metadata["method"], "rnnt_max_softmax")
+        self.assertEqual(result.runtime_metadata["actual"], "offline")
+
+    def test_timestamped_http_request_passes_runtime_policy(self) -> None:
+        response = {
+            "text": "Move it.",
+            "duration": 2.0,
+            "words": [{"word": "Move", "start": 0.2, "end": 0.5}],
+            "runtime_metadata": {"requested": "throughput", "actual": "offline"},
+        }
+        completed = mock.Mock(stdout=json.dumps(response))
+        with mock.patch.object(pipeline, "run", return_value=completed) as mocked:
+            result = pipeline.transcribe_openai_compatible_timestamped(
+                Path("audio.wav"),
+                url="http://localhost:1239/v1/audio/transcriptions",
+                model="nemotron",
+                api_key="",
+                include_confidence=True,
+                language="en-US",
+                runtime="throughput",
+                memory_limit_gb=8.0,
+                max_offline_seconds=600.0,
+            )
+        command = mocked.call_args.args[0]
+        self.assertIn("runtime=throughput", command)
+        self.assertIn("memory_limit_gb=8.0", command)
+        self.assertIn("max_offline_seconds=600.0", command)
+        self.assertEqual(result.runtime_metadata["actual"], "offline")
 
     def test_parse_rejects_text_only_response(self) -> None:
         with self.assertRaisesRegex(pipeline.PipelineError, "did not return word timestamps"):
@@ -342,6 +374,9 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(args.asr_workers, 7)
         self.assertEqual(args.asr_mode, "whole")
         self.assertTrue(args.asr_confidence)
+        self.assertEqual(args.asr_runtime, "provider-default")
+        self.assertIsNone(args.asr_memory_limit_gb)
+        self.assertIsNone(args.asr_max_offline_seconds)
         self.assertEqual(args.visual_review_provider, "none")
         self.assertTrue(args.burn)
 

@@ -6,7 +6,9 @@ transcripts, translated subtitles, and an optional hard-subtitled MP4.
 The default workflow sends one mono audio track to a timestamp-capable ASR
 provider. Native word timestamps assign the continuous transcript into
 five-second subtitle anchors without cutting model context at every boundary.
-The original independent-window workflow remains available with
+The bundled Nemotron server can choose fast offline encoding when the input
+fits a configurable GPU-memory budget, or bounded cache-aware streaming for
+longer inputs. The original independent-window workflow remains available with
 `--asr-mode segmented`; it adds overlap and stitches boundary text.
 
 ## What it produces
@@ -155,6 +157,45 @@ Use `--asr-language en-US` when the spoken language is known. `auto` is the
 portable default, but explicit Nemotron prompt conditioning can materially
 improve recognition.
 
+### Nemotron throughput and streaming policy
+
+For the bundled Transformers server, whole-file requests can select how the
+model executes without giving up word timestamps or optional confidence:
+
+```bash
+video-subtitle-pipeline video.mp4 \
+  --asr-mode whole \
+  --asr-runtime auto \
+  --asr-memory-limit-gb 18 \
+  --asr-max-offline-seconds 900 \
+  --asr-confidence
+```
+
+- `auto` uses offline full-spectrogram encoding when the provider estimates it
+  fits both current free VRAM and the supplied budget; otherwise it streams.
+- `throughput` removes the provider's automatic duration cap, while still
+  honoring explicit memory and duration limits.
+- `streaming` always uses fixed-size cache-aware chunks and bounded encoder
+  memory.
+- `provider-default` sends no nonstandard runtime field and is the portable
+  default for other OpenAI-compatible ASR services. The ignored local config
+  for this deployment selects `auto` explicitly.
+
+If offline allocation still runs out of memory, the bundled server clears the
+failed allocation and retries with streaming. Its verbose response records the
+requested/actual runtime, selection reason, fallback, elapsed time, and peak
+allocated/reserved GPU memory; the pipeline preserves this metadata in the
+manifest. By default it releases unused offline cache after each request so the
+peak does not become steady GPU occupancy.
+The memory calculation is an estimate calibrated through environment values,
+not a CUDA allocation guarantee.
+
+The HTTP endpoint currently returns one final JSON response. Streaming mode
+reduces memory and uses the model's low-latency execution path, but progressive
+partial captions over SSE/WebSocket remain future work. Likewise, true batch
+size means multiple independent recordings or live streams; it is distinct
+from the duration of one offline input.
+
 ## Confidence-assisted frame review
 
 The bundled Transformers server can attach an RNNT maximum-softmax score to
@@ -227,8 +268,8 @@ video-subtitle-pipeline video.mp4 \
 
 The adapter imports Transformers only when invoked; it is not a core dependency.
 For a timestamp/confidence-capable HTTP deployment, use
-`providers/nemotron_transformers_server.py`; it runs long inputs as one
-cache-aware stream and exposes OpenAI-style verbose word timestamps plus
+`providers/nemotron_transformers_server.py`; it exposes offline, automatic, and
+cache-aware streaming execution with OpenAI-style verbose word timestamps plus
 optional decoder confidence.
 
 ### Local LLM through Ollama

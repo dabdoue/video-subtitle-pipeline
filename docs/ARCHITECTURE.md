@@ -28,10 +28,20 @@ audio track and returns ordered words with start/end seconds. Each word is
 assigned to the nominal anchor containing its temporal midpoint. The raw words,
 their times, and the complete audio bounds remain in the manifest.
 
-The bundled Nemotron Transformers server uses cache-aware stateful streaming
-inside a single request, so long media does not require unbounded encoder
-activations. Its padded final inference chunk is clipped to the true media
-duration before transcript text is reconstructed.
+The bundled Nemotron Transformers server separates timestamp generation from
+execution policy. Offline mode passes one full feature tensor and encodes the
+spectrogram up front. Streaming mode passes a generator of fixed-size features
+and preserves encoder attention/convolution caches across chunks. Both paths
+return RNNT token durations, so both produce timestamps and optional confidence.
+
+`auto` estimates offline incremental memory from input duration, current free
+VRAM, a reserved margin, and optional user limits. It selects offline when the
+estimate fits and streaming otherwise. A CUDA out-of-memory failure during an
+offline attempt triggers one streaming retry. The runtime decision and actual
+path remain in the ASR response and final manifest.
+
+Streaming keeps bounded encoder activations. Its padded final inference chunk
+is clipped to the true media duration before transcript text is reconstructed.
 
 ## Decoder confidence
 
@@ -112,7 +122,9 @@ evidence. Reusing that manifest as `--anchors` skips already supplied work.
 
 ## Concurrency and failure handling
 
-Whole mode makes one ASR request. Segmented ASR windows use a bounded thread
+Whole mode makes one ASR request. The current server serializes inference on a
+single model instance because its generation state and confidence hook are not
+safe to mutate concurrently. Segmented ASR windows use a bounded thread
 pool; results are assigned by segment object, not completion order. Failed
 parallel requests are retried once sequentially; a second failure stops the
 run.
