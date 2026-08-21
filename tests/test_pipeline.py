@@ -136,6 +136,63 @@ class OverlapTests(unittest.TestCase):
         self.assertEqual(segments[0].text, "Reviewed source text.")
 
 
+class TimestampedASRTests(unittest.TestCase):
+    def test_parse_verbose_word_timestamps(self) -> None:
+        result = pipeline.parse_asr_result(
+            {
+                "text": "Move the robot arm.",
+                "duration": 6.0,
+                "words": [
+                    {"word": "Move", "start": 0.8, "end": 1.1},
+                    {"word": "the", "start": 1.1, "end": 1.3},
+                    {"word": "robot", "start": 4.8, "end": 5.2},
+                    {"word": "arm.", "start": 5.2, "end": 5.6},
+                ],
+            }
+        )
+        self.assertEqual(result.duration, 6.0)
+        self.assertEqual(result.words[2].word, "robot")
+
+    def test_parse_rejects_text_only_response(self) -> None:
+        with self.assertRaisesRegex(pipeline.PipelineError, "did not return word timestamps"):
+            pipeline.parse_asr_result({"text": "Text only."})
+
+    def test_timestamp_midpoints_assign_words_to_nominal_anchors(self) -> None:
+        segments = pipeline.fixed_segments(10, 5)
+        result = pipeline.ASRResult(
+            text="Move the robot arm.",
+            duration=10,
+            words=[
+                pipeline.ASRWord("Move", 0.8, 1.1),
+                pipeline.ASRWord("the", 1.1, 1.3),
+                pipeline.ASRWord("robot", 4.8, 5.2),
+                pipeline.ASRWord("arm.", 5.2, 5.6),
+            ],
+        )
+        pipeline.assign_timestamped_words(segments, result, duration=10)
+        self.assertEqual(segments[0].text, "Move the")
+        self.assertEqual(segments[1].text, "robot arm.")
+        self.assertEqual(segments[1].asr_words[0].start, 4.8)
+        self.assertEqual(segments[0].asr_audio_start, 0)
+        self.assertEqual(segments[0].asr_audio_end, 10)
+
+    def test_timestamp_assignment_preserves_reviewed_anchor(self) -> None:
+        segments = [
+            pipeline.Segment("reviewed", 0, 5, text="Reviewed wording."),
+            pipeline.Segment("missing", 5, 10),
+        ]
+        result = pipeline.ASRResult(
+            text="raw first raw second",
+            words=[
+                pipeline.ASRWord("raw", 1.0, 1.2),
+                pipeline.ASRWord("second", 6.0, 6.5),
+            ],
+        )
+        pipeline.assign_timestamped_words(segments, result, duration=10)
+        self.assertEqual(segments[0].text, "Reviewed wording.")
+        self.assertEqual(segments[1].text, "second")
+
+
 class ConfigTests(unittest.TestCase):
     def test_config_loads_defaults_and_cli_overrides_them(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -149,6 +206,7 @@ class ConfigTests(unittest.TestCase):
             )
         self.assertEqual(args.audio_overlap, 1.5)
         self.assertEqual(args.asr_workers, 7)
+        self.assertEqual(args.asr_mode, "whole")
         self.assertTrue(args.burn)
 
     def test_unknown_config_key_is_rejected(self) -> None:

@@ -2,9 +2,10 @@
 
 ## Transcription quality
 
-- Overlap improves boundary context, but the ASR response currently lacks
-  word-level timestamps. The stitcher infers ownership from duplicate text and
-  neighboring context; it does not listen to the audio itself.
+- Whole mode depends on a provider that exposes genuine word timestamps. A
+  text-only or superficially OpenAI-compatible endpoint must use segmented mode.
+- Timestamp accuracy is limited to the ASR encoder frame rate and word
+  aggregation. It is alignment evidence, not a human-verified boundary.
 - ASR systems may emit different spellings for the same overlapped phrase. An
   LLM can reconcile many cases, but neither the LLM nor deterministic fallback
   can guarantee the true wording.
@@ -12,9 +13,9 @@
   speakers far from the microphone require human review.
 - A small anchor improves synchronization but supplies less semantic context.
   One-second overlap is a practical default, not a universal optimum.
-- Streaming Nemotron models are designed to carry encoder state across chunks.
-  Independent HTTP/CLI requests do not preserve that state; overlap is a
-  workaround, not equivalent streaming inference.
+- The bundled Nemotron server preserves encoder state across internal chunks.
+  Independent segmented HTTP/CLI requests do not; overlap remains a workaround
+  for those providers.
 
 ## Stitching and translation
 
@@ -29,8 +30,9 @@
 
 ## Timing
 
-- Each stitched source segment is assigned to its original nominal anchor. The
-  pipeline does not generate word- or phoneme-level timing.
+- Whole mode assigns timestamped words to nominal anchors by word midpoint. It
+  does not produce phoneme-level timing. Segmented mode retains anchor-level
+  timing only.
 - Multi-part translations are split evenly inside the anchor. Pause-aware cue
   splitting from the original prototype is not included in this standalone
   version because it was not reliable enough to keep as a default.
@@ -60,7 +62,8 @@
 
 ## Security and privacy
 
-- Remote ASR receives extracted audio windows. The video itself is not uploaded.
+- Remote whole-file ASR receives the extracted audio track; segmented ASR
+  receives extracted windows. The video container itself is not uploaded.
 - Translation/stitch providers receive transcript text, timing, and model
   prompts. They do not receive video or audio unless a custom provider does so.
 - Local config and `.env` are ignored, but users must still inspect `git status`

@@ -100,7 +100,25 @@ https://github.com/NVIDIA/NeMo-Speech.cpp/blob/main/docs/clients.md
 The official model card documents Transformers support. Install a PyTorch build
 appropriate for CUDA, Apple MPS, or CPU, then install the model-card minimum
 Transformers version. This repository supplies `providers/nemotron_transformers.py`
-as a command adapter.
+as a segmented command adapter and `providers/nemotron_transformers_server.py`
+as a timestamp-capable HTTP server.
+
+The HTTP server uses Nemotron's cache-aware streaming path inside one request,
+returns native word timestamps, and clips its padded final inference chunk to
+the true audio duration:
+
+```bash
+export NEMOTRON_MODEL_DIR=/path/to/nemotron-3.5-asr-streaming-0.6b
+export NEMOTRON_SERVED_NAME=nemotron-3.5-asr
+export NEMOTRON_LOOKAHEAD_TOKENS=13
+export CUDA_VISIBLE_DEVICES=0
+python providers/nemotron_transformers_server.py
+```
+
+Then use `--asr-mode whole` with
+`http://127.0.0.1:1239/v1/audio/transcriptions`. Lookahead 13 corresponds to
+the model's highest documented streaming latency/accuracy setting (1120 ms);
+interactive applications may prefer a smaller supported value.
 
 This path is convenient for Python environments but downloads a larger full
 checkpoint and has a heavier dependency stack than the GGUF runtime.
@@ -164,8 +182,9 @@ video-subtitle-pipeline video.mp4 \
   --use-source-text
 ```
 
-The pipeline's short mono WAV windows stay well below the documented per-file
-limit. Free-tier quotas and supported models may change.
+Whole-file audio must remain below the provider's documented per-file limit;
+otherwise use `--asr-mode segmented`. Free-tier quotas and supported models may
+change.
 
 - Speech-to-text documentation: https://console.groq.com/docs/speech-to-text
 - Billing/free-tier FAQ: https://console.groq.com/docs/billing-faqs

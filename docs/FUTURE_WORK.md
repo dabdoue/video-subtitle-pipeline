@@ -36,10 +36,8 @@ Acceptance notes:
 - Investigate optional embedded MP4 `mov_text`, but do not treat it as the
   portable website delivery format.
 
-## Word-timestamp or stateful ASR
+## ASR confidence and alternate streaming providers
 
-- Accept verbose ASR responses with word timestamps and use those timestamps to
-  assign overlap text deterministically.
 - Add provider capabilities for frame-, token-, and word-level ASR confidence.
   NeMo RNNT decoding can be configured to preserve these scores, but the
   default Nemotron response is text-only and not every serving adapter exposes
@@ -51,9 +49,9 @@ Acceptance notes:
   correction. Do not treat a decoder score as a calibrated probability that a
   word is correct; establish useful thresholds against reviewed, in-domain
   recordings first.
-- Support one stateful streaming session across the complete audio track for
-  models such as Nemotron 3.5, while retaining nominal subtitle anchors.
-- Compare independent-window overlap against cache-aware streaming quality.
+- Extend native whole-file timestamps and stateful streaming beyond the bundled
+  Nemotron Transformers server to command and hosted providers.
+- Benchmark independent-window overlap against cache-aware streaming quality.
 
 Useful references:
 

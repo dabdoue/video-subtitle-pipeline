@@ -3,10 +3,11 @@
 A repeatable, auditable workflow for turning a video into timed source
 transcripts, translated subtitles, and an optional hard-subtitled MP4.
 
-The default workflow uses five-second subtitle anchors. Each ASR request may
-include one second of extra audio before and after its nominal anchor, then a
-stitching stage reconciles the overlapping transcripts so boundary words are
-not cut or repeated.
+The default workflow sends one mono audio track to a timestamp-capable ASR
+provider. Native word timestamps assign the continuous transcript into
+five-second subtitle anchors without cutting model context at every boundary.
+The original independent-window workflow remains available with
+`--asr-mode segmented`; it adds overlap and stitches boundary text.
 
 ## What it produces
 
@@ -21,9 +22,9 @@ training.ko.hardsub.mp4   # only with --burn
 The JSON manifest is the source of truth. It retains:
 
 - nominal subtitle ranges;
-- the wider audio range sent to ASR;
-- raw overlapping ASR text;
-- stitched source text;
+- the ASR mode and audio range;
+- raw source text and native word timestamps;
+- the source text assigned to each nominal anchor;
 - translation parts and rendered cue timing;
 - provider/model names without credentials or the endpoint URL.
 
@@ -86,7 +87,16 @@ Before an expensive run:
 video-subtitle-pipeline --config config.local.json video.mp4 --dry-run
 ```
 
-## The overlap workflow
+## Whole-file default and segmented fallback
+
+With `--asr-mode whole`, FFmpeg extracts one mono 16 kHz audio track. The ASR
+runtime processes it as one stateful stream and returns word timestamps. A word
+is assigned to the five-second anchor containing its temporal midpoint. No LLM
+stitching is needed, and the model retains context across subtitle boundaries.
+
+Use `--asr-mode segmented` when a provider cannot return word timestamps or an
+upload must be divided into bounded requests. In that mode, five-second anchors
+and `--audio-overlap 1` produce the following windows:
 
 With five-second anchors and `--audio-overlap 1`, nominal segment `5–10s` is
 transcribed from audio `4–11s`. Its neighbors are `0–6s` and `9–16s`.
@@ -98,7 +108,7 @@ ASR windows:      [ 0--------6 ]
                                   [ 9--------16 ]
 ```
 
-The stitcher sees raw text from neighboring windows and returns one clean
+The segmented-mode stitcher sees raw text from neighboring windows and returns one clean
 transcript for each nominal anchor. It must assign overlap speech exactly once,
 repair a cut word only when the neighboring result supports it, and preserve
 uncertainty rather than inventing content.
@@ -124,10 +134,9 @@ export ASR_API_KEY=replace-me
 
 video-subtitle-pipeline video.mp4 \
   --asr-provider openai-compatible \
+  --asr-mode whole \
   --asr-model nvidia/nemotron-3.5-asr-streaming-0.6b \
   --allow-audio-upload \
-  --audio-overlap 1 \
-  --stitch-provider codex \
   --translate-provider codex \
   --target-language Korean \
   --include-source \
@@ -135,14 +144,27 @@ video-subtitle-pipeline video.mp4 \
 ```
 
 Remote HTTP ASR refuses to run without `--allow-audio-upload`. Loopback URLs do
-not require that flag. Only temporary mono 16 kHz WAV windows are sent, never
-the video itself.
+not require that flag. Only a temporary mono 16 kHz WAV is sent, never the video
+container or frames. Whole mode requires a verbose response with `words`,
+`start`, and `end`; use `--asr-mode segmented` for text-only endpoints.
+
+### Segmented compatibility mode
+
+```bash
+video-subtitle-pipeline video.mp4 \
+  --asr-mode segmented \
+  --audio-overlap 1 \
+  --asr-workers 4 \
+  --stitch-provider codex \
+  --use-source-text
+```
 
 ### Local NeMo-Speech.cpp
 
 ```bash
 video-subtitle-pipeline video.mp4 \
   --asr-provider command \
+  --asr-mode segmented \
   --asr-model /path/to/nemotron-3.5-asr-streaming-0.6b.q8_0.gguf \
   --asr-command 'nemo-speech transcribe {audio} --model {model} --json' \
   --audio-overlap 1 \
@@ -161,12 +183,16 @@ hardware, then:
 ```bash
 video-subtitle-pipeline video.mp4 \
   --asr-provider command \
+  --asr-mode segmented \
   --asr-command 'python3 providers/nemotron_transformers.py {audio} --model {model}' \
   --asr-model nvidia/nemotron-3.5-asr-streaming-0.6b \
   --use-source-text
 ```
 
 The adapter imports Transformers only when invoked; it is not a core dependency.
+For a timestamp-capable HTTP deployment, use
+`providers/nemotron_transformers_server.py`; it runs long inputs as one
+cache-aware stream and exposes OpenAI-style verbose word timestamps.
 
 ### Local LLM through Ollama
 
@@ -236,13 +262,13 @@ python3 -m compileall -q src providers tests
 ## Project status
 
 This is a working personal-project pipeline, not a polished media production
-suite. Five-second anchors plus one-second overlap improve boundary context but
-do not replace word-level timestamps or human review. Technical names, acronyms,
-quiet speech, multiple speakers, and cross-talk remain likely correction points.
+suite. Whole-file native word timestamps avoid artificial subtitle-boundary
+cuts, while segmented overlap remains a compatibility fallback. Neither mode
+replaces human review: technical names, acronyms, quiet speech, multiple
+speakers, and cross-talk remain likely correction points.
 
 Soft/native English and translated subtitle tracks are recorded as future work
 in [Future work](docs/FUTURE_WORK.md). Hard subtitles remain the most universally
 visible delivery format.
 
 No license has been selected yet. Choose one before publishing the repository.
-

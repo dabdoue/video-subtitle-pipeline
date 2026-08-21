@@ -4,6 +4,7 @@
   "audio_overlap": 1.0,
   "audio_stream": 0,
   "asr_provider": "openai-compatible",
+  "asr_mode": "whole",
   "asr_url": "https://your-asr-host.example/v1/audio/transcriptions",
   "asr_model": "nvidia/nemotron-3.5-asr-streaming-0.6b",
   "asr_api_key_env": "ASR_API_KEY",

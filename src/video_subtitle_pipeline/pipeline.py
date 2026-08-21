@@ -18,7 +18,7 @@ from typing import Any, Callable, Iterable, Sequence
 from urllib.parse import urlparse
 
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 DEFAULT_ASR_MODEL = "nvidia/nemotron-3.5-asr-streaming-0.6b"
 
 LANGUAGE_CODES = {
@@ -45,6 +45,20 @@ class PipelineError(RuntimeError):
 
 
 @dataclass
+class ASRWord:
+    word: str
+    start: float
+    end: float
+
+
+@dataclass
+class ASRResult:
+    text: str
+    words: list[ASRWord] = field(default_factory=list)
+    duration: float | None = None
+
+
+@dataclass
 class Segment:
     id: str
     start: float
@@ -54,6 +68,7 @@ class Segment:
     raw_asr_text: str = ""
     asr_audio_start: float | None = None
     asr_audio_end: float | None = None
+    asr_words: list[ASRWord] = field(default_factory=list)
 
     @property
     def duration(self) -> float:
@@ -183,6 +198,17 @@ def parse_json_segments(path: Path) -> list[Segment]:
                     if item.get("asr_audio_end") is not None
                     else None
                 ),
+                asr_words=[
+                    ASRWord(
+                        word=normalize_text(word.get("word", word.get("text", ""))),
+                        start=float(word["start"]),
+                        end=float(word["end"]),
+                    )
+                    for word in item.get("asr_words", [])
+                    if isinstance(word, dict)
+                    and word.get("start") is not None
+                    and word.get("end") is not None
+                ],
             )
         )
     validate_segments(segments)
@@ -378,6 +404,79 @@ def transcribe_openai_compatible(
     return normalize_text(payload.get("text"))
 
 
+def parse_asr_result(payload: Any) -> ASRResult:
+    if not isinstance(payload, dict):
+        raise PipelineError("Timestamped ASR returned a non-object JSON response")
+    if payload.get("error"):
+        raise PipelineError(f"ASR error: {payload['error']}")
+    words_payload = payload.get("words")
+    if not isinstance(words_payload, list):
+        raise PipelineError(
+            "ASR did not return word timestamps. Use --asr-mode segmented or configure "
+            "the provider for verbose word timestamps."
+        )
+    words: list[ASRWord] = []
+    for index, item in enumerate(words_payload, 1):
+        if not isinstance(item, dict):
+            raise PipelineError(f"ASR word {index} is not an object")
+        text = normalize_text(item.get("word", item.get("text", "")))
+        try:
+            start = float(item["start"])
+            end = float(item["end"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PipelineError(f"ASR word {index} has invalid timestamps") from exc
+        if not text or start < 0 or end <= start:
+            raise PipelineError(f"ASR word {index} has invalid text or range")
+        words.append(ASRWord(text, start, end))
+    words.sort(key=lambda word: (word.start, word.end))
+    return ASRResult(
+        text=normalize_text(payload.get("text")),
+        words=words,
+        duration=float(payload["duration"]) if payload.get("duration") is not None else None,
+    )
+
+
+def transcribe_openai_compatible_timestamped(
+    audio: Path,
+    *,
+    url: str,
+    model: str,
+    api_key: str,
+) -> ASRResult:
+    command = [
+        "curl",
+        "--fail-with-body",
+        "--silent",
+        "--show-error",
+        "--retry",
+        "2",
+        "--retry-all-errors",
+        "--max-time",
+        "180",
+        url,
+    ]
+    if api_key:
+        command.extend(["-H", f"Authorization: Bearer {api_key}"])
+    command.extend(
+        [
+            "-F",
+            f"model={model}",
+            "-F",
+            f"file=@{audio};type=audio/wav",
+            "-F",
+            "response_format=verbose_json",
+            "-F",
+            "timestamp_granularities[]=word",
+        ]
+    )
+    result = run(command, capture=True)
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise PipelineError(f"ASR returned invalid JSON: {result.stdout[:500]}") from exc
+    return parse_asr_result(payload)
+
+
 def format_command(template: str, *, audio: Path, model: str) -> list[str]:
     try:
         return [part.format(audio=str(audio), model=model) for part in shlex.split(template)]
@@ -399,6 +498,73 @@ def transcribe_command(audio: Path, *, template: str, model: str) -> str:
     if isinstance(payload, dict):
         return normalize_text(payload.get("text", payload.get("transcript", "")))
     return normalize_text(raw)
+
+
+def transcribe_command_timestamped(audio: Path, *, template: str, model: str) -> ASRResult:
+    result = run(format_command(template, audio=audio, model=model), capture=True)
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise PipelineError(
+            "Whole-file command ASR must print JSON containing text and timestamped words"
+        ) from exc
+    return parse_asr_result(payload)
+
+
+def assign_timestamped_words(
+    segments: Sequence[Segment],
+    result: ASRResult,
+    *,
+    duration: float,
+) -> None:
+    missing = [segment for segment in segments if not segment.text]
+    if not missing:
+        return
+    missing_ids = {segment.id for segment in missing}
+    by_segment: dict[str, list[ASRWord]] = {segment.id: [] for segment in missing}
+    segment_index = 0
+    for word in result.words:
+        midpoint = (word.start + word.end) / 2
+        while segment_index + 1 < len(segments) and midpoint >= segments[segment_index].end:
+            segment_index += 1
+        segment = segments[segment_index]
+        if segment.id not in missing_ids or midpoint < segment.start or midpoint > segment.end + 0.001:
+            continue
+        by_segment[segment.id].append(word)
+
+    assigned = 0
+    for segment in missing:
+        words = by_segment[segment.id]
+        text = normalize_text(" ".join(word.word for word in words))
+        segment.raw_asr_text = text
+        segment.text = text
+        segment.asr_audio_start = 0.0
+        segment.asr_audio_end = duration
+        segment.asr_words = words
+        assigned += len(words)
+    if result.words and assigned == 0:
+        raise PipelineError("ASR returned words, but none fell inside the nominal subtitle anchors")
+
+
+def transcribe_whole_audio(
+    video: Path,
+    segments: Sequence[Segment],
+    *,
+    duration: float,
+    workdir: Path,
+    audio_stream: int,
+    transcriber: Callable[[Path], ASRResult],
+) -> None:
+    audio = workdir / "whole-audio.wav"
+    print(f"ASR: one stateful whole-file request ({duration:.2f}s)", flush=True)
+    extract_audio_window(
+        video,
+        start=0.0,
+        end=duration,
+        destination=audio,
+        audio_stream=audio_stream,
+    )
+    assign_timestamped_words(segments, transcriber(audio), duration=duration)
 
 
 def transcribe_missing_segments(
@@ -1013,10 +1179,12 @@ def write_manifest(
         "asr": {
             "provider": args.asr_provider,
             "model": args.asr_model,
+            "mode": args.asr_mode,
+            "timestamp_granularity": "word" if args.asr_mode == "whole" else None,
             "endpoint_configured": (
                 bool(args.asr_url) if args.asr_provider == "openai-compatible" else False
             ),
-            "workers": args.asr_workers,
+            "workers": args.asr_workers if args.asr_mode == "segmented" else None,
         },
         "stitching": {
             "provider": args.stitch_provider,
@@ -1051,7 +1219,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     config = load_config(preliminary.config.expanduser() if preliminary.config else None)
 
     parser = argparse.ArgumentParser(
-        description="Overlap-aware video transcription, translation, and subtitles.",
+        description="Timestamp-aware video transcription, translation, and subtitles.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -1076,6 +1244,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--language-code")
 
     parser.add_argument("--asr-provider", choices=["openai-compatible", "command"], default="openai-compatible")
+    parser.add_argument(
+        "--asr-mode",
+        choices=["whole", "segmented"],
+        default="whole",
+        help="Whole-file timestamped ASR or independent overlapping anchor requests",
+    )
     parser.add_argument("--asr-url", default=os.environ.get("ASR_URL", ""))
     parser.add_argument("--asr-model", default=os.environ.get("ASR_MODEL", DEFAULT_ASR_MODEL))
     parser.add_argument("--asr-api-key-env", default="ASR_API_KEY")
@@ -1184,6 +1358,7 @@ def execute(args: argparse.Namespace) -> int:
                     "segments_needing_asr": len(missing),
                     "audio_overlap_seconds": args.audio_overlap,
                     "asr_provider": args.asr_provider,
+                    "asr_mode": args.asr_mode,
                     "stitch_provider": args.stitch_provider,
                     "translation_provider": args.translate_provider,
                     "burn": args.burn,
@@ -1210,33 +1385,56 @@ def execute(args: argparse.Namespace) -> int:
                     raise PipelineError("--asr-url or ASR_URL is required for the HTTP ASR provider")
                 if not is_local_url(args.asr_url) and not args.allow_audio_upload:
                     raise PipelineError(
-                        "Remote ASR requires --allow-audio-upload. Only extracted WAV windows are sent."
+                        "Remote ASR requires --allow-audio-upload. Only extracted WAV audio is sent."
                     )
                 api_key = env_value(args.asr_api_key_env, env_file)
-                transcriber = lambda audio: transcribe_openai_compatible(
-                    audio,
-                    url=args.asr_url,
-                    model=args.asr_model,
-                    api_key=api_key,
-                )
+                if args.asr_mode == "whole":
+                    whole_transcriber = lambda audio: transcribe_openai_compatible_timestamped(
+                        audio,
+                        url=args.asr_url,
+                        model=args.asr_model,
+                        api_key=api_key,
+                    )
+                else:
+                    segment_transcriber = lambda audio: transcribe_openai_compatible(
+                        audio,
+                        url=args.asr_url,
+                        model=args.asr_model,
+                        api_key=api_key,
+                    )
             else:
                 if not args.asr_command:
                     raise PipelineError("--asr-command is required for command ASR")
                 command_template = args.asr_command
-                transcriber = lambda audio: transcribe_command(
-                    audio, template=command_template, model=args.asr_model
+                if args.asr_mode == "whole":
+                    whole_transcriber = lambda audio: transcribe_command_timestamped(
+                        audio, template=command_template, model=args.asr_model
+                    )
+                else:
+                    segment_transcriber = lambda audio: transcribe_command(
+                        audio, template=command_template, model=args.asr_model
+                    )
+            if args.asr_mode == "whole":
+                transcribe_whole_audio(
+                    args.video,
+                    segments,
+                    duration=video_info["duration"],
+                    workdir=workdir,
+                    audio_stream=args.audio_stream,
+                    transcriber=whole_transcriber,
                 )
-            transcribe_missing_segments(
-                args.video,
-                segments,
-                duration=video_info["duration"],
-                workdir=workdir,
-                audio_stream=args.audio_stream,
-                overlap=args.audio_overlap,
-                workers=args.asr_workers,
-                transcriber=transcriber,
-            )
-            if args.audio_overlap > 0:
+            else:
+                transcribe_missing_segments(
+                    args.video,
+                    segments,
+                    duration=video_info["duration"],
+                    workdir=workdir,
+                    audio_stream=args.audio_stream,
+                    overlap=args.audio_overlap,
+                    workers=args.asr_workers,
+                    transcriber=segment_transcriber,
+                )
+            if args.asr_mode == "segmented" and args.audio_overlap > 0:
                 stitch_transcripts(
                     segments,
                     provider=args.stitch_provider,

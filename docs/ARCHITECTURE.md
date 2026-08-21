@@ -6,21 +6,33 @@
 video
   -> probe streams/duration
   -> nominal anchors
-  -> overlapping audio windows
-  -> raw ASR transcripts
-  -> boundary stitching
-  -> source transcript per nominal anchor
+  -> one continuous audio track
+  -> stateful ASR + native word timestamps
+  -> timestamp assignment into nominal anchors
   -> optional translation
   -> timed cues
   -> SRT + manifest
   -> optional hard-sub MP4
 ```
 
-The source video is never split or concatenated. Only temporary mono 16 kHz WAV
-files are extracted. Hard-sub rendering re-encodes the video stream and copies
-the selected original audio stream.
+The source video is never split or concatenated. Whole mode extracts one
+temporary mono 16 kHz WAV. Segmented compatibility mode extracts overlapping
+WAV windows. Hard-sub rendering re-encodes the video stream and copies the
+selected original audio stream.
 
-## Nominal anchors versus ASR windows
+## Whole-file timestamp assignment
+
+Whole mode is the default. A timestamp-capable provider receives the complete
+audio track and returns ordered words with start/end seconds. Each word is
+assigned to the nominal anchor containing its temporal midpoint. The raw words,
+their times, and the complete audio bounds remain in the manifest.
+
+The bundled Nemotron Transformers server uses cache-aware stateful streaming
+inside a single request, so long media does not require unbounded encoder
+activations. Its padded final inference chunk is clipped to the true media
+duration before transcript text is reconstructed.
+
+## Segmented nominal anchors versus ASR windows
 
 Subtitle anchors remain contiguous and non-overlapping. With a nominal interval
 `[start, end]` and overlap `o`, ASR receives:
@@ -77,9 +89,10 @@ evidence. Reusing that manifest as `--anchors` skips already supplied work.
 
 ## Concurrency and failure handling
 
-ASR windows use a bounded thread pool. Results are assigned by segment object,
-not completion order. Failed parallel requests are retried once sequentially;
-a second failure stops the run.
+Whole mode makes one ASR request. Segmented ASR windows use a bounded thread
+pool; results are assigned by segment object, not completion order. Failed
+parallel requests are retried once sequentially; a second failure stops the
+run.
 
 LLM batches are sequential by design so validation failures and provider rate
 limits remain understandable. Stitch batches include neighbor context across
@@ -94,4 +107,3 @@ explicit CLI flag > JSON config > environment/default
 An explicit `--config` wins over automatic repository-local discovery.
 `VIDEO_SUBTITLE_CONFIG` is used when no flag is supplied. Finally, an existing
 `config.local.json` in the current directory is loaded.
-
