@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "video-subtitle-pipeline"
+version = "0.2.0"
+description = "Overlap-aware video transcription, translation, subtitles, and hard-sub rendering"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "License not yet selected" }
+authors = [{ name = "Project contributors" }]
+dependencies = []
+
+[project.scripts]
+video-subtitle-pipeline = "video_subtitle_pipeline.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
