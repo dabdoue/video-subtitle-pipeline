@@ -154,6 +154,12 @@ and `latest-run.log` are written to:
 ~/Movies/Video Subtitle Pipeline Outputs
 ```
 
+Dropping another item while a run is active shows its current input, phase,
+process ID, and output directory. From that dialog you can return to the
+progress window, open the destination, or confirm that the current pipeline and
+its child processes should be stopped. Logs and already-written files remain
+after cancellation; an incomplete video may not be playable.
+
 The terminal alias accepts one or more files and folders and uses the same
 output directory:
 

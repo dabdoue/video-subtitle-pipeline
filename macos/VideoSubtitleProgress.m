@@ -1,4 +1,5 @@
 #import <Cocoa/Cocoa.h>
+#import <signal.h>
 
 @interface VideoSubtitleAppDelegate : NSObject <NSApplicationDelegate>
 @property(nonatomic, copy) NSString *projectDirectory;
@@ -14,10 +15,14 @@
 @property(nonatomic, strong) NSMutableArray<NSString *> *outputPaths;
 @property(nonatomic, strong) NSMutableArray<NSString *> *errorLines;
 @property(nonatomic, strong) NSMutableArray<NSString *> *pendingInputs;
+@property(nonatomic, copy) NSArray<NSString *> *activeInputs;
+@property(nonatomic, copy) NSString *outputDirectory;
 @property(nonatomic) NSInteger currentIndex;
 @property(nonatomic) NSInteger totalVideos;
 @property(nonatomic, copy) NSString *currentName;
 @property(nonatomic) BOOL started;
+@property(nonatomic) BOOL cancelledByUser;
+@property(nonatomic) BOOL stopping;
 @end
 
 @implementation VideoSubtitleAppDelegate
@@ -71,10 +76,7 @@
 - (void)application:(NSApplication *)sender openFiles:(NSArray<NSString *> *)filenames {
     [sender replyToOpenOrPrint:NSApplicationDelegateReplySuccess];
     if (self.started) {
-        NSAlert *alert = [[NSAlert alloc] init];
-        alert.messageText = @"A subtitle run is already in progress";
-        alert.informativeText = @"Wait for the current run to finish, then drag the remaining files onto the app again.";
-        [alert runModal];
+        [self showRunningTaskAlert];
         return;
     }
     [self.pendingInputs addObjectsFromArray:filenames];
@@ -124,6 +126,7 @@
 - (void)begin:(NSArray<NSString *> *)inputs {
     if (self.started) return;
     self.started = YES;
+    self.activeInputs = inputs;
     [self.pendingInputs removeAllObjects];
 
     NSString *launcher = [self.projectDirectory stringByAppendingPathComponent:@"run-local-drop.sh"];
@@ -138,6 +141,7 @@
         [NSApp terminate:nil];
         return;
     }
+    self.outputDirectory = outputDirectory;
 
     NSError *directoryError = nil;
     if (![NSFileManager.defaultManager createDirectoryAtPath:outputDirectory
@@ -149,6 +153,132 @@
 
     [self buildProgressWindow:outputDirectory];
     [self runPipeline:inputs outputDirectory:outputDirectory launcher:launcher];
+}
+
+- (NSString *)activeInputDescription {
+    if (self.currentName.length > 0) return self.currentName;
+    if (self.activeInputs.count == 1) return self.activeInputs.firstObject.lastPathComponent;
+    if (self.activeInputs.count > 1) {
+        return [NSString stringWithFormat:@"%lu dropped items",
+            (unsigned long)self.activeInputs.count];
+    }
+    return @"Preparing input";
+}
+
+- (void)showRunningTaskAlert {
+    NSString *phase = self.statusLabel.stringValue.length > 0
+        ? self.statusLabel.stringValue : @"Preparing videos…";
+    NSString *destination = self.outputDirectory.length > 0
+        ? self.outputDirectory : self.defaultOutputDirectory;
+    pid_t processID = self.task.running ? self.task.processIdentifier : 0;
+
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = self.stopping
+        ? @"The current subtitle run is stopping"
+        : @"A subtitle run is already in progress";
+    alert.informativeText = [NSString stringWithFormat:
+        @"Current input: %@\nStatus: %@\nSaving to: %@%@\n\nThe newly dropped item was not added to this run.",
+        [self activeInputDescription], phase, destination,
+        processID > 0 ? [NSString stringWithFormat:@"\nProcess ID: %d", processID] : @""];
+    [alert addButtonWithTitle:@"Show Progress"];
+    [alert addButtonWithTitle:@"Show Output Folder"];
+    [alert addButtonWithTitle:self.stopping ? @"Stopping…" : @"Stop Current Run"];
+    [alert addButtonWithTitle:@"Dismiss"];
+    alert.buttons[2].enabled = !self.stopping && self.task.running;
+
+    NSModalResponse response = [alert runModal];
+    if (response == NSAlertFirstButtonReturn) {
+        [self.window makeKeyAndOrderFront:nil];
+        [NSApp activateIgnoringOtherApps:YES];
+    } else if (response == NSAlertSecondButtonReturn) {
+        [NSWorkspace.sharedWorkspace openURL:[NSURL fileURLWithPath:destination]];
+    } else if (response == NSAlertThirdButtonReturn && !self.stopping) {
+        [self confirmStopCurrentRun];
+    }
+}
+
+- (void)confirmStopCurrentRun {
+    NSString *destination = self.outputDirectory.length > 0
+        ? self.outputDirectory : self.defaultOutputDirectory;
+    NSAlert *confirmation = [[NSAlert alloc] init];
+    confirmation.alertStyle = NSAlertStyleWarning;
+    confirmation.messageText = @"Stop the current subtitle run?";
+    confirmation.informativeText = [NSString stringWithFormat:
+        @"Input: %@\nOutput folder: %@\n\nThe active ASR, Codex, or FFmpeg process will be terminated. The run log and any files already written will remain, but incomplete output may not be playable.",
+        [self activeInputDescription], destination];
+    [confirmation addButtonWithTitle:@"Stop Run"];
+    [confirmation addButtonWithTitle:@"Keep Running"];
+    if ([confirmation runModal] == NSAlertFirstButtonReturn) {
+        [self stopCurrentRun];
+    }
+}
+
+- (NSArray<NSNumber *> *)descendantProcessesOf:(pid_t)rootPID {
+    NSTask *processList = [[NSTask alloc] init];
+    NSPipe *output = [NSPipe pipe];
+    processList.executableURL = [NSURL fileURLWithPath:@"/bin/ps"];
+    processList.arguments = @[@"-axo", @"pid=,ppid="];
+    processList.standardOutput = output;
+    processList.standardError = [NSFileHandle fileHandleWithNullDevice];
+    if (![processList launchAndReturnError:nil]) return @[];
+    [processList waitUntilExit];
+    NSData *data = [output.fileHandleForReading readDataToEndOfFile];
+    NSString *listing = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"";
+
+    NSMutableDictionary<NSNumber *, NSMutableArray<NSNumber *> *> *children = [NSMutableDictionary dictionary];
+    [listing enumerateLinesUsingBlock:^(NSString *line, BOOL *stop) {
+        NSArray<NSString *> *fields = [line componentsSeparatedByCharactersInSet:
+            NSCharacterSet.whitespaceCharacterSet];
+        NSMutableArray<NSString *> *values = [NSMutableArray array];
+        for (NSString *field in fields) if (field.length > 0) [values addObject:field];
+        if (values.count < 2) return;
+        NSNumber *pid = @([values[0] intValue]);
+        NSNumber *parent = @([values[1] intValue]);
+        if (!children[parent]) children[parent] = [NSMutableArray array];
+        [children[parent] addObject:pid];
+    }];
+
+    NSMutableArray<NSNumber *> *descendants = [NSMutableArray array];
+    NSMutableArray<NSNumber *> *queue = [NSMutableArray arrayWithObject:@(rootPID)];
+    while (queue.count > 0) {
+        NSNumber *parent = queue.firstObject;
+        [queue removeObjectAtIndex:0];
+        for (NSNumber *child in children[parent] ?: @[]) {
+            if (![descendants containsObject:child]) {
+                [descendants addObject:child];
+                [queue addObject:child];
+            }
+        }
+    }
+    return descendants;
+}
+
+- (void)stopCurrentRun {
+    if (self.stopping || !self.task.running) return;
+    self.stopping = YES;
+    self.cancelledByUser = YES;
+    self.statusLabel.stringValue = @"Stopping current run…";
+    self.detailLabel.stringValue = [NSString stringWithFormat:@"Partial files and log remain in %@",
+        self.outputDirectory];
+
+    pid_t rootPID = self.task.processIdentifier;
+    NSArray<NSNumber *> *descendants = [self descendantProcessesOf:rootPID];
+    for (NSNumber *process in descendants.reverseObjectEnumerator) {
+        kill(process.intValue, SIGTERM);
+    }
+    kill(rootPID, SIGTERM);
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{
+        typeof(self) self = weakSelf;
+        if (!self.task.running || self.task.processIdentifier != rootPID) return;
+        NSArray<NSNumber *> *remaining = [self descendantProcessesOf:rootPID];
+        for (NSNumber *process in remaining.reverseObjectEnumerator) {
+            kill(process.intValue, SIGKILL);
+        }
+        kill(rootPID, SIGKILL);
+    });
 }
 
 - (void)buildProgressWindow:(NSString *)outputDirectory {
@@ -327,10 +457,11 @@
     self.progressBar.doubleValue = self.progressBar.maxValue;
     [self.window orderOut:nil];
 
-    BOOL succeeded = status == 0;
+    BOOL succeeded = status == 0 && !self.cancelledByUser;
     NSAlert *alert = [[NSAlert alloc] init];
     alert.alertStyle = succeeded ? NSAlertStyleInformational : NSAlertStyleCritical;
-    alert.messageText = succeeded ? @"Video subtitles completed" : @"Video subtitle processing failed";
+    alert.messageText = succeeded ? @"Video subtitles completed" :
+        (self.cancelledByUser ? @"Subtitle run stopped" : @"Video subtitle processing failed");
     NSMutableString *details = [NSMutableString stringWithFormat:
         @"Output folder:\n%@", outputDirectory];
     if (self.outputPaths.count > 0) {
@@ -342,6 +473,9 @@
             [details appendFormat:@"\n…and %lu more files",
                 (unsigned long)(self.outputPaths.count - visibleCount)];
         }
+    }
+    if (self.cancelledByUser) {
+        [details appendString:@"\n\nThe process was stopped by the user. Any incomplete media file may not be playable."];
     }
     if (!succeeded) {
         [details appendFormat:@"\n\nLog:\n%@", logPath];

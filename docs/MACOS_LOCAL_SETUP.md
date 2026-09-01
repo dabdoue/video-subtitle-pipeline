@@ -150,6 +150,9 @@ dialog with output paths. Successful runs can play the rendered video or show
 it in Finder; failed runs can open the log or output folder. Folder inputs are
 searched recursively. The source folder itself is a valid destination; generated
 `*.ko-bilingual.hardsub.*` files are skipped to avoid processing them again.
+If another item is dropped during an active run, the app shows the active input,
+phase, process ID, and destination. It can return to progress, reveal the output
+folder, or stop the pipeline and its child processes after confirmation.
 
 The equivalent terminal commands are:
 
