@@ -47,6 +47,24 @@ Guidance for humans and coding agents working in this repository.
 - Keep core dependencies at Python standard library plus external CLIs. Optional
   heavy runtimes belong in `providers/` adapters.
 
+## Codex CLI setup
+
+- Treat OpenAI's standalone Codex CLI as the supported runtime for the `codex`
+  stitching, translation, and visual-review providers. Install it with the
+  current official installer and verify both `codex --version` and
+  `codex login status` before an expensive pipeline run.
+- Authentication is a user-level prerequisite. A human must complete
+  `codex login` when no valid cached session exists. Never automate browser
+  consent, solicit credentials in chat, or read, copy, print, or commit
+  `~/.codex/auth.json`; it contains sensitive access tokens.
+- `run-local.sh` must prefer the standalone `~/.local/bin/codex`, then a normal
+  `PATH` installation. Discovery of a Codex binary bundled with the OpenAI VS
+  Code extension is a fallback for continuity, not the documented installation
+  path.
+- Codex CLI and the IDE extension can share cached login details, but do not
+  assume that installing one authenticates the other. Check status explicitly
+  and fail nonzero when the requested provider is unavailable.
+
 ## Editing workflow
 
 1. Inspect `git status --short` before editing. Preserve unrelated user work.

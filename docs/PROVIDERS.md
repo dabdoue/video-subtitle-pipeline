@@ -47,7 +47,8 @@ Verify a WAV directly:
 ```bash
 nemo-speech transcribe audio.wav \
   --model models/nemotron-3.5-asr-streaming-0.6b.q8_0.gguf \
-  --json
+  --format json \
+  --word-times
 ```
 
 Backends can be selected with `--device cuda:0`, `--device metal`,
@@ -222,7 +223,10 @@ Nemotron-capable endpoint when model consistency matters.
 
 The `codex` provider uses ephemeral, read-only `codex exec` calls and validates
 output against a generated JSON schema. The model must be available to the
-installed Codex configuration. Model names are intentionally configurable.
+installed and authenticated standalone Codex configuration. Model names are
+intentionally configurable. Follow the installation and authentication steps
+in the main README before selecting this provider; IDE-bundled binaries are a
+fallback rather than the supported installation path.
 
 ### Ollama
 

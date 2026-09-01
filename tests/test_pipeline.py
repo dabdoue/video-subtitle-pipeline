@@ -1,4 +1,6 @@
 import json
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -408,6 +410,48 @@ class PrivacyTests(unittest.TestCase):
         example = Path(__file__).parents[1] / "config.example.json"
         payload = json.loads(example.read_text(encoding="utf-8"))
         self.assertIn("your-asr-host.example", payload["asr_url"])
+
+    def test_macos_example_uses_relative_local_asr(self) -> None:
+        example = Path(__file__).parents[1] / "config.macos.example.json"
+        payload = json.loads(example.read_text(encoding="utf-8"))
+        self.assertEqual(payload["asr_provider"], "command")
+        self.assertEqual(payload["asr_mode"], "whole")
+        self.assertTrue(payload["asr_command"].startswith(".local/"))
+        self.assertTrue(payload["asr_model"].startswith("models/"))
+        self.assertNotIn("asr_url", payload)
+        self.assertFalse(payload["allow_audio_upload"])
+        self.assertFalse(payload["allow_frame_upload"])
+        self.assertEqual(payload["translate_provider"], "codex")
+        self.assertEqual(payload["reasoning_effort"], "high")
+
+
+class MacOSLauncherTests(unittest.TestCase):
+    def test_source_folder_can_also_be_the_output_folder(self) -> None:
+        repository = Path(__file__).parents[1]
+        launcher = repository / "run-local-drop.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            source = folder / "source.mp4"
+            generated = folder / "old.ko-bilingual.hardsub.mp4"
+            source.write_bytes(b"not a real video")
+            generated.write_bytes(b"not a real video")
+            environment = os.environ.copy()
+            environment["VIDEO_SUBTITLE_OUTPUT_DIR"] = str(folder)
+            result = subprocess.run(
+                [str(launcher), str(folder)],
+                cwd=repository,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+
+        combined = result.stdout + result.stderr
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("[1/1] Processing:", combined)
+        self.assertIn(str(source), combined)
+        self.assertNotIn(str(generated), combined)
 
 
 if __name__ == "__main__":
