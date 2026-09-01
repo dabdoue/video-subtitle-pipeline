@@ -69,8 +69,11 @@
 ## Media behavior
 
 - Hard subtitles require video re-encoding. The selected audio stream is copied.
-- Only one audio stream is included in the hard-sub output. Additional audio,
-  data, GPS, HDR, chapters, and camera metadata are not preserved.
+- Only one audio stream is included in the hard-sub output. Additional audio
+  and data streams are not mapped, but FFmpeg can still copy global container
+  metadata, including iPhone location/GPS tags, into the rendered file. Inspect
+  or strip metadata before sharing an output externally. HDR, chapters, and
+  camera metadata are not guaranteed to survive re-encoding.
 - The default H.264/yuv420p output is broadly compatible but not archival.
 - Variable-frame-rate input may be normalized by FFmpeg during rendering.
 - Font fallback depends on fonts installed on the machine. Missing glyphs may

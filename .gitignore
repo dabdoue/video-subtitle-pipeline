@@ -1,7 +1,10 @@
 .env
+.DS_Store
 /config.local.json
 /*.local.json
 .venv/
+/.local/
+/models/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -15,4 +18,3 @@ dist/
 *.segments.json
 *.srt
 *.vtt
-

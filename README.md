@@ -42,7 +42,7 @@ Requirements:
 - Python 3.11 or newer;
 - `ffmpeg` and `ffprobe`;
 - `curl` for an OpenAI-compatible ASR endpoint;
-- optionally `codex` for Codex CLI stitching/translation;
+- the standalone `codex` CLI for Codex stitching/translation;
 - a target-language font, such as Noto CJK, for hard subtitles.
 
 Install the CLI in an isolated environment:
@@ -55,6 +55,42 @@ video-subtitle-pipeline --help
 ```
 
 On Windows PowerShell, activate with `.venv\Scripts\Activate.ps1`.
+
+For the tested repository-local Apple Silicon/Metal installation, including
+NeMo-Speech.cpp, the Q8 model, FFmpeg, and the macOS droplet, follow
+[Fully local ASR setup on Apple Silicon](docs/MACOS_LOCAL_SETUP.md).
+
+### Codex CLI authentication
+
+When `codex` is selected for stitching or translation, install the standalone
+Codex CLI using OpenAI's current macOS/Linux installer:
+
+```bash
+curl -fsSL https://chatgpt.com/codex/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+codex --version
+```
+
+Authenticate once with the user account that should authorize the requests,
+then verify the cached session:
+
+```bash
+codex login
+codex login status
+```
+
+The browser flow signs in with ChatGPT. API-key authentication is also
+supported; follow the official authentication documentation rather than
+placing a key in this repository. Never commit or copy `~/.codex/auth.json`.
+The CLI and IDE extension share cached login details.
+
+`run-local.sh` prefers the standalone CLI at `~/.local/bin/codex`, then an
+existing `codex` on `PATH`. As a convenience fallback only, it can discover the
+Codex binary bundled with the OpenAI VS Code extension. A fresh setup should
+still install and authenticate the standalone CLI.
+
+- Codex CLI: https://developers.openai.com/codex/cli
+- Authentication: https://developers.openai.com/codex/auth
 
 ## Configuration
 
@@ -90,6 +126,44 @@ Before an expensive run:
 ```bash
 video-subtitle-pipeline --config config.local.json video.mp4 --dry-run
 ```
+
+### macOS drag-and-drop and batch launcher
+
+Install the Desktop droplet and `videosubs` zsh alias:
+
+```bash
+./install-macos-shortcuts.sh
+source "$HOME/.zshrc"
+```
+
+Drag a supported video or a folder onto **Video Subtitle Pipeline.app** on the
+Desktop. Folders are searched recursively for MP4, MOV, MKV, M4V, and WebM
+files. The app asks whether to use the default destination or choose another
+folder, then shows per-video phase progress. Dismissing the folder picker falls
+back to the default destination; the explicit Cancel button stops the run.
+The destination may be the source folder itself; generated
+`*.ko-bilingual.hardsub.*` files are excluded from recursive runs so they are
+not processed again.
+
+At completion, a success or error dialog shows the output directory and created
+file paths. A successful run can immediately play the rendered video or show it
+in Finder. A failed run can open its log or output folder. By default, results
+and `latest-run.log` are written to:
+
+```text
+~/Movies/Video Subtitle Pipeline Outputs
+```
+
+The terminal alias accepts one or more files and folders and uses the same
+output directory:
+
+```bash
+videosubs "$HOME/Downloads/video.mp4"
+videosubs "$HOME/Downloads/folder of videos"
+```
+
+Set `VIDEO_SUBTITLE_OUTPUT_DIR` to override the destination for either entry
+point.
 
 ## Whole-file default and segmented fallback
 
@@ -243,7 +317,7 @@ video-subtitle-pipeline video.mp4 \
   --asr-provider command \
   --asr-mode segmented \
   --asr-model /path/to/nemotron-3.5-asr-streaming-0.6b.q8_0.gguf \
-  --asr-command 'nemo-speech transcribe {audio} --model {model} --json' \
+  --asr-command 'nemo-speech transcribe {audio} --model {model} --format json --word-times' \
   --audio-overlap 1 \
   --stitch-provider codex \
   --use-source-text
@@ -277,7 +351,7 @@ optional decoder confidence.
 ```bash
 video-subtitle-pipeline video.mp4 \
   --asr-provider command \
-  --asr-command 'nemo-speech transcribe {audio} --model {model} --json' \
+  --asr-command 'nemo-speech transcribe {audio} --model {model} --format json --word-times' \
   --asr-model /path/to/model.gguf \
   --stitch-provider command \
   --translate-provider command \
